@@ -35,4 +35,7 @@ class MoodAnalysis(BaseModel):
 class AnalyzedMood(MoodAnalysis):
     """Full analysis record persisted to DuckDB."""
     comment_id: str
+    platform: str | None = None
+    author: str | None = None
+    comment_text: str | None = None
     processed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

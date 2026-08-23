@@ -90,7 +90,7 @@ async def run(args: argparse.Namespace) -> None:
             try:
                 await bucket.acquire()
                 mood = await analyze_comment(comment)
-                await ainsert_analyzed_mood(mood)
+                await ainsert_analyzed_mood(mood, comment)
                 logger.info(
                     "worker-%d | %s | %s | mood=%s urgency=%.2f action=%s",
                     worker_id, comment.platform, comment.id,

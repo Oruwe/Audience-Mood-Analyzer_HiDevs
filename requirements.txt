@@ -15,5 +15,7 @@ langfuse
 
 # UI & Evals
 streamlit
+streamlit-autorefresh
+pandas
 scikit-learn
 deepeval
