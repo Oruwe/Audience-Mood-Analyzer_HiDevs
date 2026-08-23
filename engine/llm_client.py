@@ -21,7 +21,7 @@ SYSTEM_PROMPT = (
 async def analyze_comment(comment: RawComment) -> AnalyzedMood:
     """Analyse one comment using Groq directly."""
     response = await acompletion(
-        model="groq/llama3-8b-8192", # The universally available, stable Groq model
+        model="groq/meta-llama/llama-4-scout-17b-16e-instruct", 
         api_key=os.environ.get("GROQ_API_KEY", ""),
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
