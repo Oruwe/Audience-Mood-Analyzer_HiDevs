@@ -1,0 +1,131 @@
+"""Central streaming runner: source -> bounded queue -> rate-limited workers -> DuckDB.
+
+Usage:
+    python pipeline.py --mode mock
+    python pipeline.py --mode live --keywords ai tech marketing --langs en
+"""
+
+import argparse
+import asyncio
+import logging
+import time
+
+from dotenv import load_dotenv
+
+load_dotenv()  # MUST run before engine import: Router reads API keys at import time
+
+from engine.llm_client import analyze_comment  # noqa: E402
+from ingestion.bluesky_stream import DEFAULT_KEYWORDS, generate_bluesky_stream  # noqa: E402
+from ingestion.mock_stream import generate_mock_stream  # noqa: E402
+from schemas import RawComment  # noqa: E402
+from storage.db import ainsert_analyzed_mood, close_connection  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+logger = logging.getLogger("pipeline")
+
+
+class TokenBucket:
+    """Async token bucket — caps LLM throughput to protect free-tier quotas."""
+
+    def __init__(self, rate_per_sec: float, burst: int = 1) -> None:
+        if rate_per_sec <= 0:
+            raise ValueError("rate_per_sec must be positive")
+        self.rate = rate_per_sec
+        self.capacity = max(burst, 1)
+        self._tokens = float(self.capacity)
+        self._updated = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self.capacity, self._tokens + (now - self._updated) * self.rate)
+                self._updated = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                deficit = 1.0 - self._tokens
+            await asyncio.sleep(deficit / self.rate)  # sleep OUTSIDE the lock
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Social-listening streaming pipeline")
+    parser.add_argument("--mode", choices=["mock", "live"], default="mock")
+    parser.add_argument("--workers", type=int, default=3, help="Concurrent analysis workers (2-4 recommended)")
+    parser.add_argument("--queue-size", type=int, default=100, help="Bounded buffer capacity")
+    parser.add_argument("--rate", type=float, default=10.0, help="Max LLM calls per minute (token bucket)")
+    parser.add_argument("--keywords", nargs="*", default=DEFAULT_KEYWORDS, help="Live-mode keyword filter")
+    parser.add_argument("--langs", nargs="*", default=None, help="Live-mode language filter, e.g. en")
+    return parser.parse_args()
+
+
+async def run(args: argparse.Namespace) -> None:
+    queue: asyncio.Queue[RawComment] = asyncio.Queue(maxsize=args.queue_size)
+    bucket = TokenBucket(rate_per_sec=args.rate / 60.0)
+    stop = asyncio.Event()
+
+    if args.mode == "mock":
+        source = generate_mock_stream()
+        logger.info("Mode=mock | workers=%d queue=%d rate=%.0f/min", args.workers, args.queue_size, args.rate)
+    else:
+        source = generate_bluesky_stream(keywords=args.keywords, langs=args.langs)
+        logger.info("Mode=live | keywords=%s | workers=%d rate=%.0f/min", args.keywords, args.workers, args.rate)
+
+    async def producer() -> None:
+        async for comment in source:
+            if stop.is_set():
+                break
+            await queue.put(comment)  # blocks when full -> natural backpressure
+
+    async def worker(worker_id: int) -> None:
+        while True:
+            try:
+                comment = await asyncio.wait_for(queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                if stop.is_set() and queue.empty():
+                    logger.info("worker-%d exiting (queue drained)", worker_id)
+                    return
+                continue
+            try:
+                await bucket.acquire()
+                mood = await analyze_comment(comment)
+                await ainsert_analyzed_mood(mood)
+                logger.info(
+                    "worker-%d | %s | %s | mood=%s urgency=%.2f action=%s",
+                    worker_id, comment.platform, comment.id,
+                    mood.mood.value, mood.urgency_score, mood.marketing_action.value,
+                )
+            except Exception:
+                logger.exception("worker-%d failed on comment %s", worker_id, comment.id)
+            finally:
+                queue.task_done()
+
+    producer_task = asyncio.create_task(producer(), name="producer")
+    worker_tasks = [asyncio.create_task(worker(i), name=f"worker-{i}") for i in range(args.workers)]
+
+    try:
+        await producer_task
+    except asyncio.CancelledError:
+        logger.info("Interrupt received — draining %d queued item(s)...", queue.qsize())
+    finally:
+        stop.set()
+        if not producer_task.done():
+            producer_task.cancel()
+        await asyncio.gather(producer_task, return_exceptions=True)
+        await queue.join()                   # workers finish in-flight + queued items
+        await asyncio.gather(*worker_tasks)  # workers exit once drained
+        close_connection()
+        logger.info("Shutdown complete. DuckDB connection closed.")
+
+
+def main() -> None:
+    args = parse_args()
+    try:
+        asyncio.run(run(args))
+    except KeyboardInterrupt:
+        pass  # second Ctrl+C force-quits; first is handled gracefully above
+
+
+if __name__ == "__main__":
+    main()

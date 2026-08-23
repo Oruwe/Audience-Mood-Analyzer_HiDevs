@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+env/
+.DS_Store
+node_modules/
+.idea/
+.vscode/
+*.log
+.aider*
+.aider.conf.yml
+
+# Secrets & local data
+.env
+data/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

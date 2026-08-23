@@ -1,0 +1,19 @@
+# AI & Orchestration
+aider-chat
+litellm
+instructor
+pydantic
+
+# Ingestion & Async
+asyncio
+faststream
+websockets>=12.0
+
+# Storage & Observability
+duckdb
+langfuse
+
+# UI & Evals
+streamlit
+scikit-learn
+deepeval
