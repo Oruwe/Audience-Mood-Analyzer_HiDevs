@@ -1,13 +1,14 @@
-"""Async LLM routing layer: Gemini primary -> Groq fallback, traced via Langfuse."""
+"""Async LLM routing layer: Groq Primary."""
 
 import os
 import litellm
 from litellm import Router
-from schemas import AnalyzedMood, MoodAnalysis, RawComment
+from dotenv import load_dotenv
 
-# --- Observability: every routed call emits a Langfuse trace ---
-litellm.success_callback = ["langfuse"]
-litellm.failure_callback = ["langfuse"]
+# Force environment variables to load
+load_dotenv()
+
+from schemas import AnalyzedMood, MoodAnalysis, RawComment
 
 SYSTEM_PROMPT = (
     "You are a social-media listening analyst. Analyse the given comment and "
@@ -23,24 +24,16 @@ _router = Router(
         {
             "model_name": "mood-analyzer",
             "litellm_params": {
-                "model": "gemini/gemini-1.5-flash",
-                "api_key": os.environ.get("GEMINI_API_KEY", ""),
-            },
-        },
-        {
-            "model_name": "mood-analyzer-fallback",
-            "litellm_params": {
-                "model": "groq/llama-3.3-70b-versatile",
+                "model": "groq/llama-3.3-70b-versatile", # Groq's active flagship model
                 "api_key": os.environ.get("GROQ_API_KEY", ""),
             },
-        },
+        }
     ],
-    fallbacks=[{"mood-analyzer": ["mood-analyzer-fallback"]}],
     num_retries=2,
 )
 
 async def analyze_comment(comment: RawComment) -> AnalyzedMood:
-    """Analyse one comment; auto-falls back to Groq if Gemini fails."""
+    """Analyse one comment using Groq."""
     response = await _router.acompletion(
         model="mood-analyzer",
         messages=[
