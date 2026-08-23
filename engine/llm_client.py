@@ -1,8 +1,7 @@
-"""Async LLM routing layer: Groq Primary."""
+"""Async LLM client: Direct Groq execution (Simplified)."""
 
 import os
-import litellm
-from litellm import Router
+from litellm import acompletion
 from dotenv import load_dotenv
 
 # Force environment variables to load
@@ -19,29 +18,18 @@ SYSTEM_PROMPT = (
     "urgency_score reflects how quickly the brand must react."
 )
 
-_router = Router(
-    model_list=[
-        {
-            "model_name": "mood-analyzer",
-            "litellm_params": {
-                "model": "groq/llama-3.3-70b-versatile", # Groq's active flagship model
-                "api_key": os.environ.get("GROQ_API_KEY", ""),
-            },
-        }
-    ],
-    num_retries=2,
-)
-
 async def analyze_comment(comment: RawComment) -> AnalyzedMood:
-    """Analyse one comment using Groq."""
-    response = await _router.acompletion(
-        model="mood-analyzer",
+    """Analyse one comment using Groq directly."""
+    response = await acompletion(
+        model="groq/llama3-8b-8192", # The universally available, stable Groq model
+        api_key=os.environ.get("GROQ_API_KEY", ""),
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"[{comment.platform}] @{comment.author}: {comment.text}"},
         ],
         response_format=MoodAnalysis, 
-        metadata={"comment_id": comment.id, "platform": comment.platform}, 
     )
+    
+    # Parse the strict JSON response into our Pydantic schema
     analysis = MoodAnalysis.model_validate_json(response.choices[0].message.content)
     return AnalyzedMood(comment_id=comment.id, **analysis.model_dump())
