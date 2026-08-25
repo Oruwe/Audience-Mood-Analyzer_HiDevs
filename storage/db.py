@@ -146,7 +146,7 @@ def query_enriched_records(limit: int | None = None) -> list[EnrichedCommentReco
 def get_comments_since(minutes: int) -> list[EnrichedCommentRecord]:
     """All enriched rows processed within the trailing N-minute window."""
     sql = ("SELECT * FROM analyzed_comments "
-           "WHERE processed_at >= current_timestamp - INTERVAL ? MINUTE "
+           "WHERE processed_at >= current_timestamp - to_minutes(?) "
            "ORDER BY processed_at DESC")
     with _connect_read() as conn:
         rows = conn.execute(sql, [minutes]).fetchall()

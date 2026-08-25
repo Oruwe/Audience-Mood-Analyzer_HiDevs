@@ -14,7 +14,6 @@ async def main():
     models = [
         "gemini/gemini-1.5-flash",
         "gemini/gemini-2.0-flash",
-        "groq/mixtral-8x7b-32768",
         "groq/llama-3.3-70b-versatile"
     ]
     

@@ -3,6 +3,7 @@ aider-chat
 litellm
 instructor
 pydantic
+python-dotenv
 
 # Ingestion & Async
 asyncio
@@ -17,5 +18,6 @@ langfuse
 streamlit
 streamlit-autorefresh
 pandas
+numpy
 scikit-learn
 deepeval

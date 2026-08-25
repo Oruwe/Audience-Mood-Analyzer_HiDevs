@@ -4,6 +4,7 @@ import logging
 import os
 import time
 
+import litellm
 from dotenv import load_dotenv
 from litellm import acompletion
 
@@ -35,9 +36,24 @@ SYSTEM_PROMPT = (
 
 # Ordered failover chain per CONVENTIONS.md (gemini primary, groq fallback).
 _MODEL_CHAIN: list[tuple[str, str]] = [
-    ("gemini/gemini-3.6-flash", "GEMINI_API_KEY"),
+    ("gemini/gemini-2.5-flash", "GEMINI_API_KEY"),
     ("groq/llama-3.3-70b-versatile", "GROQ_API_KEY"),
 ]
+
+# ---------------------------------------------------------------------------
+# Observability (CONVENTIONS.md): route every LLM call through Langfuse.
+# Callbacks activate only when credentials exist, so a missing key degrades to
+# a startup warning instead of failing every completion.
+# ---------------------------------------------------------------------------
+_LANGFUSE_ENABLED = bool(
+    os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")
+)
+if _LANGFUSE_ENABLED:
+    litellm.success_callback = ["langfuse"]
+    litellm.failure_callback = ["langfuse"]
+    logger.info("Langfuse tracing enabled (success + failure callbacks)")
+else:
+    logger.warning("Langfuse keys missing — LLM tracing disabled")
 
 
 async def analyze_comment(comment: RawComment) -> EnrichedCommentRecord:
@@ -78,6 +94,18 @@ async def analyze_comment(comment: RawComment) -> EnrichedCommentRecord:
             last_exc = exc
             logger.warning("LLM call failed on %s (%s); trying next provider", model, exc)
     raise RuntimeError(f"All LLM providers failed; last error: {last_exc}") from last_exc
+
+
+def flush_observability() -> None:
+    """Best-effort Langfuse flush at shutdown (no-op when tracing disabled)."""
+    if not _LANGFUSE_ENABLED:
+        return
+    try:
+        from langfuse import Langfuse  # lazy: keeps the hot path import-free
+
+        Langfuse().flush()
+    except Exception as exc:  # noqa: BLE001 — telemetry must never break shutdown
+        logger.debug("Langfuse flush skipped (%s)", exc)
 
 
 # Alias kept for Phase 3 API compatibility.

@@ -15,6 +15,7 @@ _THEME_MODEL = "gemini/gemini-2.5-flash"
 _MIN_CLUSTER_SIZE = 3   # below this, skip clustering entirely
 _TOP_K = 5              # summaries fed to the LLM
 _FALLBACK_THEME = "General Feedback"
+_QUOTE_CHARS = "\"'“”‘’`"  # straight + smart quotes + backtick
 
 
 async def extract_trending_theme(comments: list[EnrichedCommentRecord]) -> str:
@@ -36,6 +37,12 @@ async def extract_trending_theme(comments: list[EnrichedCommentRecord]) -> str:
         closest = np.argsort(distances)[:_TOP_K]
         summaries = [embedded[i].summary for i in closest]
 
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        # Pre-guard: never spend a network round-trip on a call we know will fail.
+        logger.info("theme summariser skipped (GEMINI_API_KEY unset); using fallback")
+        return _FALLBACK_THEME
+
     prompt = (
         "These are summaries of recent social-media comments about one emerging issue:\n"
         + "\n".join(f"- {s}" for s in summaries)
@@ -44,12 +51,13 @@ async def extract_trending_theme(comments: list[EnrichedCommentRecord]) -> str:
     try:
         response = await litellm.acompletion(
             model=_THEME_MODEL,
-            api_key=os.environ.get("GEMINI_API_KEY", ""),
+            api_key=api_key,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=16,
             timeout=15,
         )
-        theme = (response.choices[0].message.content or "").strip().strip('"')
+        raw = (response.choices[0].message.content or "").strip()
+        theme = raw.strip(_QUOTE_CHARS).strip()  # harden against wrapped quotes
         return theme or _FALLBACK_THEME
     except Exception as exc:  # noqa: BLE001 — radar must never crash the pipeline
         logger.warning("theme LLM call failed (%s); using fallback", exc)

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Standalone Phase-1 verification harness for the ingestion layer.
+"""Standalone verification harness: Phase-1 ingestion contracts plus a fully
+hermetic Phase-4 radar suite (temp DuckDB file, stubbed litellm — no network,
+no real LLM calls, no cost).
 
-Locates the project root, imports ingestion.normalizer.sanitize_comment_text
-and ingestion.dedup.ContentDeduplicator, then runs async verification checks.
+Locates the project root, imports ingestion.normalizer.sanitize_comment_text,
+ingestion.dedup.ContentDeduplicator, engine.anomaly_detector.detect_anomalies
+and engine.topic_cluster.extract_trending_theme, then runs async checks.
 
 Usage:
     python run_test.py
@@ -16,7 +19,10 @@ import asyncio
 import logging
 import os
 import sys
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _find_repo_root() -> Path:
@@ -125,21 +131,148 @@ async def verify_deduplicator() -> None:
             os.environ["REDIS_URL"] = saved
 
 
+async def verify_phase4_radar() -> None:
+    print("\n─── Phase 4 radar: anomaly detector + theme cluster ────────")
+
+    try:
+        import duckdb
+        import litellm as litellm_mod
+        import storage.db as db_mod
+        from engine.anomaly_detector import detect_anomalies
+        from engine.topic_cluster import extract_trending_theme
+        from schemas import (
+            EnrichedCommentRecord,
+            PrimaryIntent,
+            RecommendedAction,
+            Sentiment,
+        )
+    except ImportError as exc:
+        check("phase-4 imports available", False, str(exc))
+        return
+
+    tmp = tempfile.TemporaryDirectory()
+    original_db_path = db_mod.DB_PATH
+    db_mod.DB_PATH = Path(tmp.name) / "radar_hermetic.duckdb"
+
+    def synth(i: int, urgency: float, summary: str) -> EnrichedCommentRecord:
+        return EnrichedCommentRecord(
+            comment_id=f"radar-{i:03d}",
+            platform="bluesky",
+            author_handle=f"@radar_tester_{i}",
+            raw_text=f"synthetic radar comment {i}",
+            sentiment=Sentiment.NEGATIVE,
+            confidence=0.92,
+            primary_intent=PrimaryIntent.BUG_REPORT,
+            urgency_score=urgency,
+            emotional_drivers=["frustration"],
+            summary=summary,
+            recommended_action=RecommendedAction.ESCALATE_TO_SUPPORT,
+            suggested_reply_draft=None,
+            brand_safety_flag=False,
+            embedding=None,
+            cluster_id=None,
+            latency_ms=11.0,
+            model_used="hermetic",
+            processed_at=datetime.now(timezone.utc),
+        )
+
+    def clear_window() -> None:
+        with duckdb.connect(str(db_mod.DB_PATH)) as conn:
+            conn.execute("DELETE FROM analyzed_comments")
+
+    llm_calls = {"count": 0}
+
+    async def fake_acompletion(*args, **kwargs):
+        llm_calls["count"] += 1
+        message = SimpleNamespace(content='  "Login Outage Storm"  ')
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    real_acompletion = litellm_mod.acompletion
+    litellm_mod.acompletion = fake_acompletion
+    saved_gemini_key = os.environ.pop("GEMINI_API_KEY", None)
+
+    try:
+        # -- empty warehouse -------------------------------------------------
+        check("empty warehouse -> no alert", await detect_anomalies() is None)
+
+        # -- calm window -----------------------------------------------------
+        for i in range(4):
+            await db_mod.insert_enriched_record(synth(i, 0.20, f"calm note {i}"))
+        check("calm window -> no alert", await detect_anomalies() is None)
+
+        # -- mean-trigger CRITICAL + stubbed theme summarisation --------------
+        for i in range(4, 8):
+            await db_mod.insert_enriched_record(synth(i, 0.95, f"login broken {i}"))
+        alert = await detect_anomalies()
+        check("hot window raises alert", alert is not None)
+        if alert is not None:
+            check("mean-trigger severity is CRITICAL",
+                  alert.severity == "CRITICAL", alert.severity)
+            check("alert covers whole window", len(alert.affected_comment_ids) == 8)
+            check("theme via stubbed LLM, quotes stripped",
+                  alert.theme == "Login Outage Storm", alert.theme)
+            check("trigger reason carries stats", "mean urgency" in alert.trigger_reason)
+        clear_window()
+
+        # -- WARNING path: mean <= 0.70 but >= 3 hard spikes -------------------
+        # NB: 0.05 (not 0.10) keeps the float mean at 0.6875, safely below the
+        # strict "> 0.70" mean trigger — 0.10 floats to 0.7000000000000001.
+        for i, u in enumerate([0.90, 0.90, 0.90, 0.05]):
+            await db_mod.insert_enriched_record(synth(100 + i, u, f"spike note {i}"))
+        alert = await detect_anomalies()
+        check("spike-only window still alerts", alert is not None)
+        if alert is not None:
+            check("spike-trigger severity is WARNING",
+                  alert.severity == "WARNING", alert.severity)
+        clear_window()
+
+        # -- theme cluster: below minimum cluster size -> fallback, no LLM -----
+        pair = [synth(200, 0.99, "a"), synth(201, 0.98, "b")]
+        calls_before = llm_calls["count"]
+        check("tiny batch -> fallback theme",
+              await extract_trending_theme(pair) == "General Feedback")
+        check("tiny batch made zero LLM calls", llm_calls["count"] == calls_before)
+
+        # -- theme cluster: API-key pre-guard -----------------------------------
+        trio = [synth(300, 0.97, "s1"), synth(301, 0.96, "s2"), synth(302, 0.95, "s3")]
+        calls_before = llm_calls["count"]
+        check("missing GEMINI_API_KEY -> fallback, no call",
+              await extract_trending_theme(trio) == "General Feedback"
+              and llm_calls["count"] == calls_before)
+
+        # -- theme cluster: happy path through the stub --------------------------
+        os.environ["GEMINI_API_KEY"] = "hermetic-fake-key"
+        theme = await extract_trending_theme(trio)
+        check("key present -> stubbed theme returned",
+              theme == "Login Outage Storm", theme)
+        check("happy path hit the LLM exactly once",
+              llm_calls["count"] == calls_before + 1)
+    finally:
+        litellm_mod.acompletion = real_acompletion
+        if saved_gemini_key is not None:
+            os.environ["GEMINI_API_KEY"] = saved_gemini_key
+        else:
+            os.environ.pop("GEMINI_API_KEY", None)
+        db_mod.DB_PATH = original_db_path
+        tmp.cleanup()
+
+
 async def main() -> int:
     print("=" * 60)
-    print("Phase 1 verification: normalizer + deduplicator")
+    print("Verification: Phase-1 ingestion + Phase-4 radar (hermetic)")
     print(f"project root: {REPO_ROOT}")
     print("=" * 60)
 
     verify_normalizer()
     await verify_deduplicator()
+    await verify_phase4_radar()
 
     passed = sum(ok for _, ok in _results)
     total = len(_results)
     print("\n" + "=" * 60)
     print(f"RESULT: {passed}/{total} checks passed")
     if passed == total:
-        print("All Phase-1 ingestion contracts verified ✅")
+        print("All Phase-1 + Phase-4 contracts verified ✅")
     else:
         print("Some checks FAILED — see ❌ rows above.")
     print("=" * 60)

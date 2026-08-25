@@ -15,7 +15,8 @@ from dotenv import load_dotenv
 load_dotenv()  # MUST run before engine import: Router reads API keys at import time
 
 from engine.anomaly_detector import detect_anomalies  # noqa: E402
-from engine.llm_client import analyze_comment  # noqa: E402
+from engine.embedder import generate_embedding  # noqa: E402
+from engine.llm_client import analyze_comment, flush_observability  # noqa: E402
 from ingestion.bluesky_stream import DEFAULT_KEYWORDS  # noqa: E402
 from ingestion.broker import stream_inbound_comments  # noqa: E402
 from schemas import RawComment  # noqa: E402
@@ -23,6 +24,8 @@ from storage.db import ainsert_enriched_record, close_connection  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
 logger = logging.getLogger("pipeline")
+
+_ALERT_COOLDOWN_SEC = 300.0  # minimum gap between logged crisis alerts
 
 
 class TokenBucket:
@@ -90,6 +93,10 @@ async def run(args: argparse.Namespace) -> None:
             try:
                 await bucket.acquire()
                 record = await analyze_comment(comment)
+                # Phase 4 theme clustering needs vectors. The embedder never
+                # raises (local hash fallback), so this cannot kill the worker;
+                # it shares the worker's rate slot to keep quota math simple.
+                record.embedding = await generate_embedding(comment.text)
                 await ainsert_enriched_record(record)
                 logger.info(
                     "worker-%d | %s | %s | sentiment=%s intent=%s urgency=%.2f action=%s",
@@ -103,6 +110,7 @@ async def run(args: argparse.Namespace) -> None:
                 queue.task_done()
 
     async def crisis_monitor() -> None:
+        last_alert_at: float | None = None
         while not stop.is_set():
             await asyncio.sleep(60)
             try:
@@ -110,9 +118,17 @@ async def run(args: argparse.Namespace) -> None:
             except Exception:
                 logger.exception("crisis_monitor iteration failed")
                 continue
-            if alert is not None:
-                logger.error("🚨 CRISIS ALERT: %s | %s",
-                             alert.theme, alert.trigger_reason)
+            if alert is None:
+                continue
+            now = time.monotonic()
+            if last_alert_at is not None and (now - last_alert_at) < _ALERT_COOLDOWN_SEC:
+                logger.info(
+                    "crisis_monitor: %s alert suppressed (%.0fs of cooldown left)",
+                    alert.severity, _ALERT_COOLDOWN_SEC - (now - last_alert_at),
+                )
+                continue
+            last_alert_at = now
+            logger.error("🚨 CRISIS ALERT: %s | %s", alert.theme, alert.trigger_reason)
 
     producer_task = asyncio.create_task(producer(), name="producer")
     worker_tasks = [asyncio.create_task(worker(i), name=f"worker-{i}") for i in range(args.workers)]
@@ -132,6 +148,7 @@ async def run(args: argparse.Namespace) -> None:
         await queue.join()                   # workers finish in-flight + queued items
         await asyncio.gather(*worker_tasks)  # workers exit once drained
         close_connection()
+        flush_observability()
         logger.info("Shutdown complete. DuckDB connection closed.")
 
 
