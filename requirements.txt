@@ -1,13 +1,10 @@
 # AI & Orchestration
-aider-chat
 litellm
 instructor
 pydantic
 python-dotenv
 
 # Ingestion & Async
-asyncio
-faststream
 websockets>=12.0
 
 # Storage & Observability
@@ -17,7 +14,7 @@ langfuse
 # UI & Evals
 streamlit
 streamlit-autorefresh
-pandas
-numpy
-scikit-learn
-deepeval
+pandas>=2.2.2
+numpy>=2.1
+scipy>=1.14
+scikit-learn>=1.5
