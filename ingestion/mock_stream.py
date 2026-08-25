@@ -52,7 +52,7 @@ async def generate_mock_stream(
             id=f"mock-{uuid.uuid4().hex[:12]}",
             platform=platform,
             text=text,
-            author=author,
+            author_handle=author,
             timestamp=datetime.now(timezone.utc),
         )
         await asyncio.sleep(random.uniform(*delay_range))

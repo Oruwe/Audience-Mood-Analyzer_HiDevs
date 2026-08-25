@@ -2,7 +2,7 @@
 
 Usage:
     python pipeline.py --mode mock
-    python pipeline.py --mode live --keywords ai tech marketing --langs en
+    python pipeline.py --mode live --keywords ai tech marketing
 """
 
 import argparse
@@ -15,10 +15,10 @@ from dotenv import load_dotenv
 load_dotenv()  # MUST run before engine import: Router reads API keys at import time
 
 from engine.llm_client import analyze_comment  # noqa: E402
-from ingestion.bluesky_stream import DEFAULT_KEYWORDS, generate_bluesky_stream  # noqa: E402
-from ingestion.mock_stream import generate_mock_stream  # noqa: E402
+from ingestion.bluesky_stream import DEFAULT_KEYWORDS  # noqa: E402
+from ingestion.broker import stream_inbound_comments  # noqa: E402
 from schemas import RawComment  # noqa: E402
-from storage.db import ainsert_analyzed_mood, close_connection  # noqa: E402
+from storage.db import ainsert_enriched_record, close_connection  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
 logger = logging.getLogger("pipeline")
@@ -56,7 +56,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--queue-size", type=int, default=100, help="Bounded buffer capacity")
     parser.add_argument("--rate", type=float, default=10.0, help="Max LLM calls per minute (token bucket)")
     parser.add_argument("--keywords", nargs="*", default=DEFAULT_KEYWORDS, help="Live-mode keyword filter")
-    parser.add_argument("--langs", nargs="*", default=None, help="Live-mode language filter, e.g. en")
     return parser.parse_args()
 
 
@@ -65,12 +64,12 @@ async def run(args: argparse.Namespace) -> None:
     bucket = TokenBucket(rate_per_sec=args.rate / 60.0)
     stop = asyncio.Event()
 
+    source_mode = "bluesky" if args.mode == "live" else "mock"
     if args.mode == "mock":
-        source = generate_mock_stream()
         logger.info("Mode=mock | workers=%d queue=%d rate=%.0f/min", args.workers, args.queue_size, args.rate)
     else:
-        source = generate_bluesky_stream(keywords=args.keywords, langs=args.langs)
         logger.info("Mode=live | keywords=%s | workers=%d rate=%.0f/min", args.keywords, args.workers, args.rate)
+    source = stream_inbound_comments(source_mode=source_mode, keywords=args.keywords)
 
     async def producer() -> None:
         async for comment in source:
@@ -89,12 +88,13 @@ async def run(args: argparse.Namespace) -> None:
                 continue
             try:
                 await bucket.acquire()
-                mood = await analyze_comment(comment)
-                await ainsert_analyzed_mood(mood, comment)
+                record = await analyze_comment(comment)
+                await ainsert_enriched_record(record)
                 logger.info(
-                    "worker-%d | %s | %s | mood=%s urgency=%.2f action=%s",
+                    "worker-%d | %s | %s | sentiment=%s intent=%s urgency=%.2f action=%s",
                     worker_id, comment.platform, comment.id,
-                    mood.mood.value, mood.urgency_score, mood.marketing_action.value,
+                    record.sentiment.value, record.primary_intent.value,
+                    record.urgency_score, record.recommended_action.value,
                 )
             except Exception:
                 logger.exception("worker-%d failed on comment %s", worker_id, comment.id)

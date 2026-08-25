@@ -14,7 +14,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-from storage.db import query_analyzed_comments
+from storage.db import query_enriched_records
 
 METRICS_PATH = Path("data/eval_metrics.json")
 REFRESH_MS = 10_000  # poll the warehouse every 10 s while ingestion runs
@@ -37,7 +37,7 @@ def _extract_accuracy(metrics: dict[str, Any]) -> float | None:
 @st.cache_data(ttl=5, show_spinner="Querying DuckDB…")
 def load_analyzed_comments(limit: int) -> tuple[list[dict[str, Any]], str | None]:
     try:
-        records = query_analyzed_comments(limit=limit)
+        records = query_enriched_records(limit=limit)
     except FileNotFoundError:
         return [], "No warehouse yet — run `python pipeline.py --mode mock` first."
     except Exception as exc:
@@ -50,13 +50,16 @@ def build_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
         {
             "Time": r["processed_at"],
             "Platform": r.get("platform", "—"),
-            "Author": r.get("author", "—"),
-            "Comment": r.get("comment_text", ""),
+            "Author": r.get("author_handle") or "—",
+            "Comment": r.get("raw_text", ""),
             "Summary": r["summary"],
-            "Mood": r["mood"],
+            "Sentiment": r["sentiment"],
+            "Intent": r["primary_intent"],
             "Confidence": r["confidence"],
             "Urgency": r["urgency_score"],
-            "Action": r["marketing_action"],
+            "Action": r["recommended_action"],
+            "Latency (ms)": round(r.get("latency_ms", 0.0), 1),
+            "Model": r.get("model_used") or "—",
         }
         for r in rows
     ])

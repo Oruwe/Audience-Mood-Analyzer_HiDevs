@@ -1,9 +1,11 @@
 """Node 5 — Evaluation layer.
 
 Runs every case in evals/test_dataset.json through the production router
-(engine.llm_client.analyze_comment), scores mood detection with scikit-learn,
-prints a classification report, and persists raw metrics to
-data/eval_metrics.json for the Streamlit dashboard.
+(engine.llm_client.analyze_comment), scores sentiment detection with a lenient
+3-class scheme (strict accuracy on positive/neutral/negative; 'mixed' ground
+truth counts as correct when the model predicts either polarity), prints a
+classification report, and persists raw metrics to data/eval_metrics.json for
+the Streamlit dashboard.
 
 Usage (from repo root):
     python -m evals.benchmark
@@ -29,14 +31,15 @@ from sklearn.metrics import (  # noqa: E402
 )
 
 from engine.llm_client import analyze_comment  # noqa: E402
-from schemas import Mood, RawComment  # noqa: E402
+from schemas import RawComment  # noqa: E402
 
 DATASET_PATH = Path(__file__).resolve().parent / "test_dataset.json"
 METRICS_PATH = REPO_ROOT / "data" / "eval_metrics.json"
 
 MAX_CONCURRENCY = 2      # max simultaneous LLM calls (free-tier safety)
 STAGGER_SECONDS = 4.0    # gap between task starts (~15 requests/min)
-LABELS = [m.value for m in Mood]
+COARSE_LABELS = ["positive", "neutral", "negative"]            # 3-class eval space
+VALID_EXPECTED = {"positive", "neutral", "negative", "mixed"}  # dataset label set
 
 
 @dataclass
@@ -48,13 +51,12 @@ class CaseResult:
 
 
 def load_dataset() -> list[dict]:
-    """Load the dataset and fail fast if any expected_mood drifts from the enum."""
+    """Load the dataset and fail fast if any expected label drifts from the label set."""
     cases = json.loads(DATASET_PATH.read_text(encoding="utf-8"))
-    valid = {m.value for m in Mood}
     bad = [
         (i, c.get("expected_mood"))
         for i, c in enumerate(cases)
-        if c.get("expected_mood") not in valid
+        if c.get("expected_mood") not in VALID_EXPECTED
     ]
     if bad:
         raise SystemExit(f"Invalid expected_mood values in {DATASET_PATH}: {bad}")
@@ -70,14 +72,14 @@ async def evaluate_case(
             id=f"eval-{index:03d}",
             platform=case["platform"],
             text=case["text"],
-            author="eval_harness",
+            author_id="eval_harness",
             timestamp=datetime.now(timezone.utc),
         )
         try:
             analyzed = await analyze_comment(comment)
             result = CaseResult(
                 index=index, expected=case["expected_mood"],
-                predicted=analyzed.mood.value, error=None,
+                predicted=analyzed.sentiment.value, error=None,
             )
         except Exception as exc:  # both providers failed — record and move on
             result = CaseResult(
@@ -93,7 +95,7 @@ async def evaluate_case(
 
 async def run_benchmark() -> None:
     cases = load_dataset()
-    print("=== Node 5: Mood Detection Benchmark ===")
+    print("=== Node 5: Sentiment Detection Benchmark ===")
     print(f"Loaded {len(cases)} cases from {DATASET_PATH}")
     print(f"Concurrency={MAX_CONCURRENCY}, stagger={STAGGER_SECONDS}s\n")
 
@@ -112,38 +114,61 @@ async def run_benchmark() -> None:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "total_cases": len(cases),
         "failed_cases": len(failed),
-        "labels": LABELS,
+        "labels": COARSE_LABELS,
     }
 
     if not succeeded:
         print("\nAll cases failed — check API keys / connectivity. No metrics written.")
-        metrics.update({"accuracy": None, "confusion_matrix": None,
-                        "classification_report": None})
+        metrics.update({"accuracy": None, "accuracy_lenient": None,
+                        "mixed_cases": 0, "mixed_covered": 0,
+                        "confusion_matrix": None, "classification_report": None})
     else:
-        y_true = [r.expected for r in succeeded]
-        y_pred = [r.predicted for r in succeeded]
+        def coarse(s: str) -> str:
+            return {"strongly_positive": "positive",
+                    "critical_escalation": "negative"}.get(s, s)
 
-        accuracy = float(accuracy_score(y_true, y_pred))
-        cm = confusion_matrix(y_true, y_pred, labels=LABELS)
-        report_str = classification_report(
-            y_true, y_pred, labels=LABELS, digits=3, zero_division=0
-        )
-        report_dict = classification_report(
-            y_true, y_pred, labels=LABELS, output_dict=True, zero_division=0
-        )
+        scored = [(r.expected, coarse(r.predicted)) for r in succeeded]
+        strict_pairs = [(e, p) for e, p in scored if e != "mixed"]
+        mixed_preds = [p for e, p in scored if e == "mixed"]
 
-        print("\n--- Classification Report ---")
-        print(report_str)
-        print(f"Confusion matrix (rows=true, cols=predicted): {LABELS}")
-        for label, row in zip(LABELS, cm.tolist()):
-            print(f"  {label:<9}{row}")
-        print(f"\nAccuracy: {accuracy:.3f} "
-              f"({len(succeeded)}/{len(cases)} scored, {len(failed)} failed)")
+        y_true = [e for e, _ in strict_pairs]
+        y_pred = [p for _, p in strict_pairs]
+
+        accuracy_strict: float | None = None
+        cm = None
+        report_dict = None
+        if y_true:
+            accuracy_strict = float(accuracy_score(y_true, y_pred))
+            cm = confusion_matrix(y_true, y_pred, labels=COARSE_LABELS)
+            report_dict = classification_report(
+                y_true, y_pred, labels=COARSE_LABELS, output_dict=True, zero_division=0
+            )
+            print("\n--- Classification Report (3-class, 'mixed' excluded) ---")
+            print(classification_report(
+                y_true, y_pred, labels=COARSE_LABELS, digits=3, zero_division=0))
+            print(f"Confusion matrix (rows=true, cols=predicted): {COARSE_LABELS}")
+            for label, row in zip(COARSE_LABELS, cm.tolist()):
+                print(f"  {label:<9}{row}")
+
+        mixed_correct = sum(1 for p in mixed_preds if p in {"positive", "negative"})
+        strict_correct = sum(1 for e, p in strict_pairs if e == p)
+        accuracy_lenient = (strict_correct + mixed_correct) / len(succeeded)
+
+        if accuracy_strict is not None:
+            print(f"\nStrict accuracy (non-mixed): {accuracy_strict:.3f} "
+                  f"({len(strict_pairs)} scored)")
+        else:
+            print("\nStrict accuracy: n/a — every scored case was 'mixed'")
+        print(f"Lenient accuracy (mixed counts if pos/neg): {accuracy_lenient:.3f}")
+        print(f"Mixed cases: {mixed_correct}/{len(mixed_preds)} resolved to a polarity")
 
         metrics.update({
-            "accuracy": accuracy,
-            "confusion_matrix": cm.tolist(),       # numpy -> native lists
-            "classification_report": report_dict,  # per-mood precision/recall/F1
+            "accuracy": accuracy_strict,          # dashboard keeps reading this key
+            "accuracy_lenient": accuracy_lenient,
+            "mixed_cases": len(mixed_preds),
+            "mixed_covered": mixed_correct,
+            "confusion_matrix": cm.tolist() if cm is not None else None,
+            "classification_report": report_dict,
         })
 
     METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)

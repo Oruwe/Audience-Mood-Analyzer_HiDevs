@@ -63,7 +63,7 @@ def _to_raw_comment(msg: JetstreamMessage) -> RawComment:
         id=f"bsky:{msg.did}:{commit.rkey}",
         platform="bluesky",
         text=commit.record.text,
-        author=msg.did,  # Jetstream emits DIDs; handle resolution out of scope
+        author_id=msg.did,  # Jetstream emits DIDs; handle resolution out of scope
         timestamp=ts,
     )
 

@@ -1,48 +1,69 @@
-"""Embedded DuckDB persistence for analysed comments."""
+"""Embedded DuckDB persistence for enriched analysis records."""
 
 import asyncio
+import json
 import time
 from pathlib import Path
+
 import duckdb
-from schemas import AnalyzedMood, RawComment
+
+from schemas import EnrichedCommentRecord
 
 DB_PATH = Path("data/analytics.duckdb")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS analyzed_comments (
-    comment_id       VARCHAR PRIMARY KEY,
-    platform         VARCHAR,
-    author           VARCHAR,
-    comment_text     VARCHAR,
-    mood             VARCHAR,
-    confidence       DOUBLE,
-    summary          VARCHAR,
-    urgency_score    DOUBLE,
-    marketing_action VARCHAR,
-    processed_at     TIMESTAMPTZ
+    comment_id            VARCHAR PRIMARY KEY,
+    platform              VARCHAR,
+    author_handle         VARCHAR,
+    raw_text              VARCHAR,
+    sentiment             VARCHAR,
+    confidence            DOUBLE,
+    primary_intent        VARCHAR,
+    urgency_score         DOUBLE,
+    emotional_drivers     VARCHAR,
+    summary               VARCHAR,
+    recommended_action    VARCHAR,
+    suggested_reply_draft VARCHAR,
+    brand_safety_flag     BOOLEAN,
+    embedding             VARCHAR,
+    cluster_id            BIGINT,
+    latency_ms            DOUBLE,
+    model_used            VARCHAR,
+    processed_at          TIMESTAMPTZ
 );
 """
 
-# Upgrades DBs created before raw-comment columns existed (idempotent).
-_MIGRATIONS = [
-    "ALTER TABLE analyzed_comments ADD COLUMN IF NOT EXISTS platform VARCHAR",
-    "ALTER TABLE analyzed_comments ADD COLUMN IF NOT EXISTS author VARCHAR",
-    "ALTER TABLE analyzed_comments ADD COLUMN IF NOT EXISTS comment_text VARCHAR",
+_INSERT_SQL = ("INSERT OR REPLACE INTO analyzed_comments VALUES "
+               "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+
+_COLUMNS = [
+    "comment_id", "platform", "author_handle", "raw_text",
+    "sentiment", "confidence", "primary_intent", "urgency_score",
+    "emotional_drivers", "summary", "recommended_action",
+    "suggested_reply_draft", "brand_safety_flag", "embedding",
+    "cluster_id", "latency_ms", "model_used", "processed_at",
 ]
-
-_INSERT_SQL = "INSERT OR REPLACE INTO analyzed_comments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-
-_COLUMNS = ["comment_id", "platform", "author", "comment_text", "mood",
-            "confidence", "summary", "urgency_score", "marketing_action", "processed_at"]
 
 _LOCK_RETRIES = 6
 _LOCK_BACKOFF_SEC = 0.5
 
 
 def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
+    exists = conn.execute(
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_name = 'analyzed_comments'"
+    ).fetchone()[0]
+    if exists:
+        has_new = conn.execute(
+            "SELECT COUNT(*) FROM duckdb_columns() "
+            "WHERE table_name = 'analyzed_comments' AND column_name = 'sentiment'"
+        ).fetchone()[0]
+        if not has_new:
+            conn.execute(
+                "ALTER TABLE analyzed_comments RENAME TO analyzed_comments_legacy_v1"
+            )
     conn.execute(_SCHEMA)
-    for stmt in _MIGRATIONS:
-        conn.execute(stmt)
 
 
 def _connect_write() -> duckdb.DuckDBPyConnection:
@@ -73,16 +94,31 @@ def _connect_read() -> duckdb.DuckDBPyConnection:
     raise last_exc  # type: ignore[misc]
 
 
-def insert_analyzed_mood(mood: AnalyzedMood, comment: RawComment) -> None:
+def insert_enriched_record(record: EnrichedCommentRecord) -> None:
     with _connect_write() as conn:
         conn.execute(_INSERT_SQL, [
-            mood.comment_id, comment.platform, comment.author, comment.text,
-            mood.mood.value, mood.confidence, mood.summary,
-            mood.urgency_score, mood.marketing_action.value, mood.processed_at,
+            record.comment_id,
+            record.platform,
+            record.author_handle,
+            record.raw_text,
+            record.sentiment.value,
+            record.confidence,
+            record.primary_intent.value,
+            record.urgency_score,
+            json.dumps(record.emotional_drivers),
+            record.summary,
+            record.recommended_action.value,
+            record.suggested_reply_draft,
+            record.brand_safety_flag,
+            json.dumps(record.embedding) if record.embedding is not None else None,
+            record.cluster_id,
+            record.latency_ms,
+            record.model_used,
+            record.processed_at,
         ])
 
 
-def query_analyzed_comments(limit: int | None = None) -> list[AnalyzedMood]:
+def query_enriched_records(limit: int | None = None) -> list[EnrichedCommentRecord]:
     sql = "SELECT * FROM analyzed_comments ORDER BY processed_at DESC"
     params: list = []
     if limit is not None:
@@ -90,15 +126,25 @@ def query_analyzed_comments(limit: int | None = None) -> list[AnalyzedMood]:
         params.append(limit)
     with _connect_read() as conn:
         rows = conn.execute(sql, params).fetchall()
-    return [AnalyzedMood(**dict(zip(_COLUMNS, row))) for row in rows]
+    records: list[EnrichedCommentRecord] = []
+    for row in rows:
+        data = dict(zip(_COLUMNS, row))
+        data["emotional_drivers"] = (
+            json.loads(data["emotional_drivers"]) if data["emotional_drivers"] else []
+        )
+        data["embedding"] = (
+            json.loads(data["embedding"]) if data["embedding"] else None
+        )
+        records.append(EnrichedCommentRecord(**data))
+    return records
 
 
-async def ainsert_analyzed_mood(mood: AnalyzedMood, comment: RawComment) -> None:
-    await asyncio.to_thread(insert_analyzed_mood, mood, comment)
+async def ainsert_enriched_record(record: EnrichedCommentRecord) -> None:
+    await asyncio.to_thread(insert_enriched_record, record)
 
 
-async def aquery_analyzed_comments(limit: int | None = None) -> list[AnalyzedMood]:
-    return await asyncio.to_thread(query_analyzed_comments, limit)
+async def aquery_enriched_records(limit: int | None = None) -> list[EnrichedCommentRecord]:
+    return await asyncio.to_thread(query_enriched_records, limit)
 
 
 def close_connection() -> None:
