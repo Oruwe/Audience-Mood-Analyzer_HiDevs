@@ -118,14 +118,7 @@ def insert_enriched_record(record: EnrichedCommentRecord) -> None:
         ])
 
 
-def query_enriched_records(limit: int | None = None) -> list[EnrichedCommentRecord]:
-    sql = "SELECT * FROM analyzed_comments ORDER BY processed_at DESC"
-    params: list = []
-    if limit is not None:
-        sql += " LIMIT ?"
-        params.append(limit)
-    with _connect_read() as conn:
-        rows = conn.execute(sql, params).fetchall()
+def _rows_to_records(rows: list[tuple]) -> list[EnrichedCommentRecord]:
     records: list[EnrichedCommentRecord] = []
     for row in rows:
         data = dict(zip(_COLUMNS, row))
@@ -137,6 +130,43 @@ def query_enriched_records(limit: int | None = None) -> list[EnrichedCommentReco
         )
         records.append(EnrichedCommentRecord(**data))
     return records
+
+
+def query_enriched_records(limit: int | None = None) -> list[EnrichedCommentRecord]:
+    sql = "SELECT * FROM analyzed_comments ORDER BY processed_at DESC"
+    params: list = []
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    with _connect_read() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return _rows_to_records(rows)
+
+
+_ESCALATION_ACTIONS = ("escalate_to_support", "escalate_to_pr")
+_URGENT_THRESHOLD = 0.8
+
+
+def get_top_urgent_escalations(limit: int = 5) -> list[EnrichedCommentRecord]:
+    """Highest-urgency rows needing escalation, newest first."""
+    sql = (
+        "SELECT * FROM analyzed_comments "
+        f"WHERE urgency_score >= {_URGENT_THRESHOLD} "
+        f"OR recommended_action IN {repr(_ESCALATION_ACTIONS)} "
+        "ORDER BY urgency_score DESC, processed_at DESC LIMIT ?"
+    )
+    with _connect_read() as conn:
+        rows = conn.execute(sql, [limit]).fetchall()
+    return _rows_to_records(rows)
+
+
+async def aget_top_urgent_escalations(limit: int = 5) -> list[EnrichedCommentRecord]:
+    return await asyncio.to_thread(get_top_urgent_escalations, limit)
+
+
+async def ainsert_analyzed_mood(record: EnrichedCommentRecord) -> None:
+    """Alias kept for Phase 3 API compatibility."""
+    await ainsert_enriched_record(record)
 
 
 async def ainsert_enriched_record(record: EnrichedCommentRecord) -> None:

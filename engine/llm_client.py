@@ -78,3 +78,7 @@ async def analyze_comment(comment: RawComment) -> EnrichedCommentRecord:
             last_exc = exc
             logger.warning("LLM call failed on %s (%s); trying next provider", model, exc)
     raise RuntimeError(f"All LLM providers failed; last error: {last_exc}") from last_exc
+
+
+# Alias kept for Phase 3 API compatibility.
+analyze_comment_deep = analyze_comment
