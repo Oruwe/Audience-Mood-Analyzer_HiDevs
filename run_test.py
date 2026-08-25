@@ -199,6 +199,7 @@ async def verify_phase4_radar() -> None:
         for i in range(4):
             await db_mod.insert_enriched_record(synth(i, 0.20, f"calm note {i}"))
         check("calm window -> no alert", await detect_anomalies() is None)
+        clear_window()  # isolate next window: mean-trigger must see only hot rows
 
         # -- mean-trigger CRITICAL + stubbed theme summarisation --------------
         for i in range(4, 8):
@@ -208,7 +209,7 @@ async def verify_phase4_radar() -> None:
         if alert is not None:
             check("mean-trigger severity is CRITICAL",
                   alert.severity == "CRITICAL", alert.severity)
-            check("alert covers whole window", len(alert.affected_comment_ids) == 8)
+            check("alert covers whole window", len(alert.affected_comment_ids) == 4)
             check("theme via stubbed LLM, quotes stripped",
                   alert.theme == "Login Outage Storm", alert.theme)
             check("trigger reason carries stats", "mean urgency" in alert.trigger_reason)

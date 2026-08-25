@@ -12,7 +12,7 @@ async def main():
     print("--- Testing API Keys & Models ---\n")
     
     models = [
-        "gemini/gemini-1.5-flash",
+        "gemini/gemini-2.5-flash",
         "gemini/gemini-2.0-flash",
         "groq/llama-3.3-70b-versatile"
     ]
