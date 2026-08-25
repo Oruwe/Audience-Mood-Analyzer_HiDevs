@@ -1,13 +1,17 @@
 """Embedded DuckDB persistence for enriched analysis records."""
 
+import ast
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 
 import duckdb
 
 from schemas import EnrichedCommentRecord
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = Path("data/analytics.duckdb")
 
@@ -118,16 +122,28 @@ def insert_enriched_record(record: EnrichedCommentRecord) -> None:
         ])
 
 
+def _parse_jsonish(raw: object, fallback: object) -> object:
+    """Tolerant column decoder: JSON first, Python-literal second, else fallback."""
+    if raw is None or isinstance(raw, (list, dict)):
+        return raw  # NULL, or a native DuckDB LIST/STRUCT already materialised
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        try:
+            return ast.literal_eval(raw)  # handles "None", "['a', 'b']", "(1, 2)"
+        except Exception:
+            logger.warning("unparseable column value %r — using fallback", str(raw)[:60])
+            return fallback
+
+
 def _rows_to_records(rows: list[tuple]) -> list[EnrichedCommentRecord]:
     records: list[EnrichedCommentRecord] = []
     for row in rows:
         data = dict(zip(_COLUMNS, row))
-        data["emotional_drivers"] = (
-            json.loads(data["emotional_drivers"]) if data["emotional_drivers"] else []
-        )
-        data["embedding"] = (
-            json.loads(data["embedding"]) if data["embedding"] else None
-        )
+        data["emotional_drivers"] = _parse_jsonish(data["emotional_drivers"], [])
+        data["embedding"] = _parse_jsonish(data["embedding"], None)
         records.append(EnrichedCommentRecord(**data))
     return records
 
