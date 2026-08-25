@@ -1,4 +1,4 @@
-"""Async LLM client: Direct Groq execution (Simplified)."""
+"""Async LLM client: Direct Gemini execution (Simplified)."""
 
 import os
 from litellm import acompletion
@@ -19,10 +19,10 @@ SYSTEM_PROMPT = (
 )
 
 async def analyze_comment(comment: RawComment) -> AnalyzedMood:
-    """Analyse one comment using Groq directly."""
+    """Analyse one comment using Gemini directly."""
     response = await acompletion(
-        model="groq/meta-llama/llama-4-scout-17b-16e-instruct", 
-        api_key=os.environ.get("GROQ_API_KEY", ""),
+        model="gemini/gemini-3.6-flash", # Google's active 2026 model!
+        api_key=os.environ.get("GEMINI_API_KEY", ""),
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"[{comment.platform}] @{comment.author}: {comment.text}"},
