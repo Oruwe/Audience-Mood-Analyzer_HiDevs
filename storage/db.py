@@ -143,6 +143,20 @@ def query_enriched_records(limit: int | None = None) -> list[EnrichedCommentReco
     return _rows_to_records(rows)
 
 
+def get_comments_since(minutes: int) -> list[EnrichedCommentRecord]:
+    """All enriched rows processed within the trailing N-minute window."""
+    sql = ("SELECT * FROM analyzed_comments "
+           "WHERE processed_at >= current_timestamp - INTERVAL ? MINUTE "
+           "ORDER BY processed_at DESC")
+    with _connect_read() as conn:
+        rows = conn.execute(sql, [minutes]).fetchall()
+    return _rows_to_records(rows)
+
+
+async def aget_comments_since(minutes: int) -> list[EnrichedCommentRecord]:
+    return await asyncio.to_thread(get_comments_since, minutes)
+
+
 _ESCALATION_ACTIONS = ("escalate_to_support", "escalate_to_pr")
 _URGENT_THRESHOLD = 0.8
 

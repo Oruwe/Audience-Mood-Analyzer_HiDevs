@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 load_dotenv()  # MUST run before engine import: Router reads API keys at import time
 
+from engine.anomaly_detector import detect_anomalies  # noqa: E402
 from engine.llm_client import analyze_comment  # noqa: E402
 from ingestion.bluesky_stream import DEFAULT_KEYWORDS  # noqa: E402
 from ingestion.broker import stream_inbound_comments  # noqa: E402
@@ -101,8 +102,21 @@ async def run(args: argparse.Namespace) -> None:
             finally:
                 queue.task_done()
 
+    async def crisis_monitor() -> None:
+        while not stop.is_set():
+            await asyncio.sleep(60)
+            try:
+                alert = await detect_anomalies()
+            except Exception:
+                logger.exception("crisis_monitor iteration failed")
+                continue
+            if alert is not None:
+                logger.error("🚨 CRISIS ALERT: %s | %s",
+                             alert.theme, alert.trigger_reason)
+
     producer_task = asyncio.create_task(producer(), name="producer")
     worker_tasks = [asyncio.create_task(worker(i), name=f"worker-{i}") for i in range(args.workers)]
+    monitor_task = asyncio.create_task(crisis_monitor(), name="crisis_monitor")
 
     try:
         await producer_task
@@ -113,6 +127,8 @@ async def run(args: argparse.Namespace) -> None:
         if not producer_task.done():
             producer_task.cancel()
         await asyncio.gather(producer_task, return_exceptions=True)
+        monitor_task.cancel()
+        await asyncio.gather(monitor_task, return_exceptions=True)
         await queue.join()                   # workers finish in-flight + queued items
         await asyncio.gather(*worker_tasks)  # workers exit once drained
         close_connection()

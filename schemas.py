@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -66,3 +67,13 @@ class EnrichedCommentRecord(DeepMoodAnalysis):
     latency_ms: float | None = None
     model_used: str | None = None
     processed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class CrisisAlert(BaseModel):
+    """Phase 4: anomaly-radar output for a detected urgency surge."""
+    alert_id: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    severity: Literal["WARNING", "CRITICAL"]
+    theme: str = Field(description="3-word summary of the issue")
+    trigger_reason: str
+    affected_comment_ids: list[str]
