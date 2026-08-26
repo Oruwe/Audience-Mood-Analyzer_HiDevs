@@ -207,13 +207,13 @@ async def verify_phase4_radar() -> None:
 
         # -- calm window -----------------------------------------------------
         for i in range(4):
-            await db_mod.insert_enriched_record(synth(i, 0.20, f"calm note {i}"))
+            await db_mod.ainsert_enriched_record(synth(i, 0.20, f"calm note {i}"))
         check("calm window -> no alert", await detect_anomalies() is None)
         clear_window()  # isolate next window: mean-trigger must see only hot rows
 
         # -- mean-trigger CRITICAL + stubbed theme summarisation --------------
         for i in range(4, 8):
-            await db_mod.insert_enriched_record(synth(i, 0.95, f"login broken {i}"))
+            await db_mod.ainsert_enriched_record(synth(i, 0.95, f"login broken {i}"))
         alert = await detect_anomalies()
         check("hot window raises alert", alert is not None)
         if alert is not None:
@@ -229,7 +229,7 @@ async def verify_phase4_radar() -> None:
         # NB: 0.05 (not 0.10) keeps the float mean at 0.6875, safely below the
         # strict "> 0.70" mean trigger — 0.10 floats to 0.7000000000000001.
         for i, u in enumerate([0.90, 0.90, 0.90, 0.05]):
-            await db_mod.insert_enriched_record(synth(100 + i, u, f"spike note {i}"))
+            await db_mod.ainsert_enriched_record(synth(100 + i, u, f"spike note {i}"))
         alert = await detect_anomalies()
         check("spike-only window still alerts", alert is not None)
         if alert is not None:
