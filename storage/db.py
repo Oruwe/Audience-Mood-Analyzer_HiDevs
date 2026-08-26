@@ -13,7 +13,8 @@ from schemas import EnrichedCommentRecord
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path("data/analytics.duckdb")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DB_PATH = REPO_ROOT / "data" / "analytics.duckdb"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS analyzed_comments (
@@ -53,27 +54,29 @@ _LOCK_RETRIES = 6
 _LOCK_BACKOFF_SEC = 0.5
 
 
+def _missing_columns(conn: duckdb.DuckDBPyConnection) -> list[str]:
+    present = {
+        row[0]
+        for row in conn.execute(
+            "SELECT column_name FROM duckdb_columns() "
+            "WHERE table_name = 'analyzed_comments'"
+        ).fetchall()
+    }
+    return [col for col in _COLUMNS if col not in present]
+
+
 def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
     exists = conn.execute(
         "SELECT COUNT(*) FROM information_schema.tables "
         "WHERE table_name = 'analyzed_comments'"
     ).fetchone()[0]
-    if exists:
-        present = {
-            row[0]
-            for row in conn.execute(
-                "SELECT column_name FROM duckdb_columns() "
-                "WHERE table_name = 'analyzed_comments'"
-            ).fetchall()
-        }
-        missing = [col for col in _COLUMNS if col not in present]
-        if missing:
-            # Stale pre-embedding layout — archive it and recreate fresh.
-            # Timestamped suffix keeps repeat migrations collision-free.
-            conn.execute(
-                f"ALTER TABLE analyzed_comments RENAME TO "
-                f"analyzed_comments_legacy_{int(time.time())}"
-            )
+    if exists and _missing_columns(conn):
+        # Stale pre-embedding layout — archive it and recreate fresh.
+        # Timestamped suffix keeps repeat migrations collision-free.
+        conn.execute(
+            f"ALTER TABLE analyzed_comments RENAME TO "
+            f"analyzed_comments_legacy_{int(time.time())}"
+        )
     conn.execute(_SCHEMA)
 
 
@@ -103,6 +106,30 @@ def _connect_read() -> duckdb.DuckDBPyConnection:
             last_exc = exc
             time.sleep(_LOCK_BACKOFF_SEC)
     raise last_exc  # type: ignore[misc]
+
+
+def _migrate_stale_file() -> None:
+    """Upgrade a legacy warehouse before read-only access.
+
+    Readers open the file read-only and cannot ALTER anything, so a stale
+    file would crash the dashboard indefinitely. Probe with a read-only
+    connection; if columns are missing, briefly take the write lock (which
+    runs _ensure_schema) to archive + recreate. Best-effort: if the pipeline
+    holds the write lock, skip quietly and let the normal read path proceed.
+    """
+    if not DB_PATH.exists():
+        return  # preserve the callers' FileNotFoundError behaviour
+    try:
+        with _connect_read() as conn:
+            if not _missing_columns(conn):
+                return
+    except Exception:  # noqa: BLE001 — locked/unreadable; read path will report it
+        return
+    try:
+        with _connect_write():
+            pass  # _ensure_schema inside _connect_write performs the migration
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not migrate legacy warehouse (%s); read may fail", exc)
 
 
 def insert_enriched_record(record: EnrichedCommentRecord) -> None:
@@ -156,6 +183,7 @@ def _rows_to_records(rows: list[tuple]) -> list[EnrichedCommentRecord]:
 
 
 def query_enriched_records(limit: int | None = None) -> list[EnrichedCommentRecord]:
+    _migrate_stale_file()
     sql = "SELECT * FROM analyzed_comments ORDER BY processed_at DESC"
     params: list = []
     if limit is not None:
@@ -168,6 +196,7 @@ def query_enriched_records(limit: int | None = None) -> list[EnrichedCommentReco
 
 def get_comments_since(minutes: int) -> list[EnrichedCommentRecord]:
     """All enriched rows processed within the trailing N-minute window."""
+    _migrate_stale_file()
     sql = ("SELECT * FROM analyzed_comments "
            "WHERE processed_at >= current_timestamp - to_minutes(?) "
            "ORDER BY processed_at DESC")
@@ -186,6 +215,7 @@ _URGENT_THRESHOLD = 0.8
 
 def get_top_urgent_escalations(limit: int = 5) -> list[EnrichedCommentRecord]:
     """Highest-urgency rows needing escalation, newest first."""
+    _migrate_stale_file()
     sql = (
         "SELECT * FROM analyzed_comments "
         f"WHERE urgency_score >= {_URGENT_THRESHOLD} "
