@@ -13,8 +13,7 @@ async def main():
     
     models = [
         "gemini/gemini-3.6-flash",
-        "groq/llama-3.1-8b-instant",
-        "groq/meta-llama/llama-4-scout-17b-16e-instruct",
+        "groq/openai/gpt-oss-20b",
     ]
     
     for model in models:

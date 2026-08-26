@@ -35,12 +35,11 @@ SYSTEM_PROMPT = (
 )
 
 # Ordered failover chain per CONVENTIONS.md (gemini primary, groq fallback).
-# Third link is belt-and-braces: same GEMINI/GROQ keys, zero cost until invoked,
-# catches per-model rate limits / capacity issues on the 8b-instant workhorse.
+# gpt-oss-20b is the active Groq developer-tier model; the legacy Llama
+# endpoints are enterprise-restricted and must not be referenced here.
 _MODEL_CHAIN: list[tuple[str, str]] = [
     ("gemini/gemini-3.6-flash", "GEMINI_API_KEY"),
-    ("groq/llama-3.1-8b-instant", "GROQ_API_KEY"),
-    ("groq/meta-llama/llama-4-scout-17b-16e-instruct", "GROQ_API_KEY"),
+    ("groq/openai/gpt-oss-20b", "GROQ_API_KEY"),
 ]
 
 # ---------------------------------------------------------------------------
