@@ -16,7 +16,7 @@ async def main():
     try:
         print("⏳ Testing Groq API...")
         response = await litellm.acompletion(
-            model="groq/llama3-8b-8192",
+            model="groq/llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": "Testing 123"}]
         )
         print("✅ SUCCESS! The model and key are working.")

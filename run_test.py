@@ -192,6 +192,16 @@ async def verify_phase4_radar() -> None:
     saved_gemini_key = os.environ.pop("GEMINI_API_KEY", None)
 
     try:
+        # -- theme cluster: API-key pre-guard (key intentionally absent here) ----
+        trio = [synth(300, 0.97, "s1"), synth(301, 0.96, "s2"), synth(302, 0.95, "s3")]
+        calls_before = llm_calls["count"]
+        check("missing GEMINI_API_KEY -> fallback, no call",
+              await extract_trending_theme(trio) == "General Feedback"
+              and llm_calls["count"] == calls_before)
+
+        # -- arm the stub for every LLM-backed path below --------------------------
+        os.environ["GEMINI_API_KEY"] = "hermetic-fake-key"
+
         # -- empty warehouse -------------------------------------------------
         check("empty warehouse -> no alert", await detect_anomalies() is None)
 
@@ -234,15 +244,8 @@ async def verify_phase4_radar() -> None:
               await extract_trending_theme(pair) == "General Feedback")
         check("tiny batch made zero LLM calls", llm_calls["count"] == calls_before)
 
-        # -- theme cluster: API-key pre-guard -----------------------------------
-        trio = [synth(300, 0.97, "s1"), synth(301, 0.96, "s2"), synth(302, 0.95, "s3")]
-        calls_before = llm_calls["count"]
-        check("missing GEMINI_API_KEY -> fallback, no call",
-              await extract_trending_theme(trio) == "General Feedback"
-              and llm_calls["count"] == calls_before)
-
         # -- theme cluster: happy path through the stub --------------------------
-        os.environ["GEMINI_API_KEY"] = "hermetic-fake-key"
+        calls_before = llm_calls["count"]
         theme = await extract_trending_theme(trio)
         check("key present -> stubbed theme returned",
               theme == "Login Outage Storm", theme)
