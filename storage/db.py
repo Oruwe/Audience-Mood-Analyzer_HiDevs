@@ -65,18 +65,54 @@ def _missing_columns(conn: duckdb.DuckDBPyConnection) -> list[str]:
     return [col for col in _COLUMNS if col not in present]
 
 
+def _backfill_from_legacy(conn: duckdb.DuckDBPyConnection, legacy_name: str) -> None:
+    """Carry overlapping columns from *legacy_name* into the fresh table.
+
+    Columns introduced since the legacy snapshot (e.g. ``embedding``) are
+    filled with NULL — downstream consumers already tolerate missing vectors
+    and cluster ids. On any failure the brand-new table stays empty and the
+    archive is preserved for manual recovery, matching the old behaviour.
+    """
+    try:
+        present = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM duckdb_columns() "
+                f"WHERE table_name = '{legacy_name}'"
+            ).fetchall()
+        }
+        select_parts = [f'"{col}"' if col in present else "NULL" for col in _COLUMNS]
+        carried = [col for col in _COLUMNS if col in present]
+        inserted = int(conn.execute(
+            f"INSERT INTO analyzed_comments "
+            f"SELECT {', '.join(select_parts)} FROM {legacy_name}"
+        ).fetchone()[0])
+        logger.info(
+            "schema migration: carried %d row(s) forward from %s (columns: %s)",
+            inserted, legacy_name, ", ".join(carried) or "none",
+        )
+    except Exception as exc:  # noqa: BLE001 — startup must survive a bad legacy file
+        logger.warning(
+            "auto-backfill from %s failed (%s); starting empty — "
+            "archive table kept for manual recovery",
+            legacy_name, exc,
+        )
+
+
 def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
     exists = conn.execute(
         "SELECT COUNT(*) FROM information_schema.tables "
         "WHERE table_name = 'analyzed_comments'"
     ).fetchone()[0]
     if exists and _missing_columns(conn):
-        # Stale pre-embedding layout — archive it and recreate fresh.
+        # Stale pre-embedding layout — archive it, recreate fresh, then pull
+        # every still-compatible column across so history survives upgrades.
         # Timestamped suffix keeps repeat migrations collision-free.
-        conn.execute(
-            f"ALTER TABLE analyzed_comments RENAME TO "
-            f"analyzed_comments_legacy_{int(time.time())}"
-        )
+        legacy_name = f"analyzed_comments_legacy_{int(time.time())}"
+        conn.execute(f"ALTER TABLE analyzed_comments RENAME TO {legacy_name}")
+        conn.execute(_SCHEMA)
+        _backfill_from_legacy(conn, legacy_name)
+        return
     conn.execute(_SCHEMA)
 
 
@@ -114,8 +150,9 @@ def _migrate_stale_file() -> None:
     Readers open the file read-only and cannot ALTER anything, so a stale
     file would crash the dashboard indefinitely. Probe with a read-only
     connection; if columns are missing, briefly take the write lock (which
-    runs _ensure_schema) to archive + recreate. Best-effort: if the pipeline
-    holds the write lock, skip quietly and let the normal read path proceed.
+    runs _ensure_schema) to archive + recreate + backfill. Best-effort: if
+    the pipeline holds the write lock, skip quietly and let the normal read
+    path proceed.
     """
     if not DB_PATH.exists():
         return  # preserve the callers' FileNotFoundError behaviour
