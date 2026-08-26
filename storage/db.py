@@ -59,13 +59,20 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
         "WHERE table_name = 'analyzed_comments'"
     ).fetchone()[0]
     if exists:
-        has_new = conn.execute(
-            "SELECT COUNT(*) FROM duckdb_columns() "
-            "WHERE table_name = 'analyzed_comments' AND column_name = 'sentiment'"
-        ).fetchone()[0]
-        if not has_new:
+        present = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM duckdb_columns() "
+                "WHERE table_name = 'analyzed_comments'"
+            ).fetchall()
+        }
+        missing = [col for col in _COLUMNS if col not in present]
+        if missing:
+            # Stale pre-embedding layout — archive it and recreate fresh.
+            # Timestamped suffix keeps repeat migrations collision-free.
             conn.execute(
-                "ALTER TABLE analyzed_comments RENAME TO analyzed_comments_legacy_v1"
+                f"ALTER TABLE analyzed_comments RENAME TO "
+                f"analyzed_comments_legacy_{int(time.time())}"
             )
     conn.execute(_SCHEMA)
 
