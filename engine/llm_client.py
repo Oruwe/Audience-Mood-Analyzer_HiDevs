@@ -35,9 +35,12 @@ SYSTEM_PROMPT = (
 )
 
 # Ordered failover chain per CONVENTIONS.md (gemini primary, groq fallback).
+# Third link is belt-and-braces: same GEMINI/GROQ keys, zero cost until invoked,
+# catches per-model rate limits / capacity issues on the 8b-instant workhorse.
 _MODEL_CHAIN: list[tuple[str, str]] = [
-    ("gemini/gemini-2.5-flash", "GEMINI_API_KEY"),
-    ("groq/llama-3.3-70b-versatile", "GROQ_API_KEY"),
+    ("gemini/gemini-3.6-flash", "GEMINI_API_KEY"),
+    ("groq/llama-3.1-8b-instant", "GROQ_API_KEY"),
+    ("groq/meta-llama/llama-4-scout-17b-16e-instruct", "GROQ_API_KEY"),
 ]
 
 # ---------------------------------------------------------------------------

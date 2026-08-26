@@ -11,7 +11,7 @@ from schemas import EnrichedCommentRecord
 
 logger = logging.getLogger(__name__)
 
-_THEME_MODEL = "gemini/gemini-2.5-flash"
+_THEME_MODEL = "gemini/gemini-3.6-flash"
 _MIN_CLUSTER_SIZE = 3   # below this, skip clustering entirely
 _TOP_K = 5              # summaries fed to the LLM
 _FALLBACK_THEME = "General Feedback"

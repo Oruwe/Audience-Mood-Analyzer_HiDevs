@@ -12,9 +12,9 @@ async def main():
     print("--- Testing API Keys & Models ---\n")
     
     models = [
-        "gemini/gemini-2.5-flash",
-        "gemini/gemini-2.0-flash",
-        "groq/llama-3.3-70b-versatile"
+        "gemini/gemini-3.6-flash",
+        "groq/llama-3.1-8b-instant",
+        "groq/meta-llama/llama-4-scout-17b-16e-instruct",
     ]
     
     for model in models:
