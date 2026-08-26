@@ -16,7 +16,7 @@ from streamlit_autorefresh import st_autorefresh
 
 from storage.db import query_enriched_records
 
-METRICS_PATH = Path("data/eval_metrics.json")
+METRICS_PATH = Path(__file__).resolve().parent / "data" / "eval_metrics.json"
 REFRESH_MS = 10_000  # poll the warehouse every 10 s while ingestion runs
 
 
