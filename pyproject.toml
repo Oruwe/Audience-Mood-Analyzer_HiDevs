@@ -1,0 +1,32 @@
+[project]
+name = "audience-mood-analyzer"
+version = "2.0.0"
+description = "Real-time social-listening platform: asyncio ingestion + tiered-LLM mood analysis, a DuckDB warehouse, a FastAPI backend, and a Streamlit Operations Console."
+requires-python = ">=3.11"
+# Runtime dependencies stay in requirements.txt (this project isn't packaged/
+# published — the README installs via `pip install -r requirements.txt`).
+# This table exists for standard project metadata and so `[tool.*]` sections
+# below have somewhere conventional to live.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+# BLE001 (bare except Exception) isn't in the default select set, but the
+# codebase deliberately uses broad catches at fail-open boundaries (provider
+# calls, telemetry flush, legacy-migration fallbacks) with an explicit
+# `# noqa: BLE001` and a comment at each site — that's a design choice, not
+# an oversight, so BLE001 stays off rather than fighting those markers.
+ignore = ["E402"]  # modules that must load .env before importing local packages
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*" = ["E402"]
+# Realistic multi-platform comment strings — wrapping them hurts readability
+# of the data table for no real benefit.
+"ingestion/mock_stream.py" = ["E501"]

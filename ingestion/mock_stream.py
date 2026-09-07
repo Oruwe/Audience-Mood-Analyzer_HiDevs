@@ -4,7 +4,7 @@ import asyncio
 import random
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from schemas import RawComment
 
@@ -53,6 +53,6 @@ async def generate_mock_stream(
             platform=platform,
             text=text,
             author_handle=author,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
         )
         await asyncio.sleep(random.uniform(*delay_range))

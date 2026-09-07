@@ -56,10 +56,13 @@ class TokenBucket:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Social-listening streaming pipeline")
     parser.add_argument("--mode", choices=["mock", "live"], default="mock")
-    parser.add_argument("--workers", type=int, default=3, help="Concurrent analysis workers (2-4 recommended)")
+    parser.add_argument("--workers", type=int, default=3,
+                        help="Concurrent analysis workers (2-4 recommended)")
     parser.add_argument("--queue-size", type=int, default=100, help="Bounded buffer capacity")
-    parser.add_argument("--rate", type=float, default=10.0, help="Max LLM calls per minute (token bucket)")
-    parser.add_argument("--keywords", nargs="*", default=DEFAULT_KEYWORDS, help="Live-mode keyword filter")
+    parser.add_argument("--rate", type=float, default=10.0,
+                        help="Max LLM calls per minute (token bucket)")
+    parser.add_argument("--keywords", nargs="*", default=DEFAULT_KEYWORDS,
+                        help="Live-mode keyword filter")
     return parser.parse_args()
 
 
@@ -70,9 +73,11 @@ async def run(args: argparse.Namespace) -> None:
 
     source_mode = "bluesky" if args.mode == "live" else "mock"
     if args.mode == "mock":
-        logger.info("Mode=mock | workers=%d queue=%d rate=%.0f/min", args.workers, args.queue_size, args.rate)
+        logger.info("Mode=mock | workers=%d queue=%d rate=%.0f/min",
+                    args.workers, args.queue_size, args.rate)
     else:
-        logger.info("Mode=live | keywords=%s | workers=%d rate=%.0f/min", args.keywords, args.workers, args.rate)
+        logger.info("Mode=live | keywords=%s | workers=%d rate=%.0f/min",
+                    args.keywords, args.workers, args.rate)
     source = stream_inbound_comments(source_mode=source_mode, keywords=args.keywords)
 
     async def producer() -> None:
@@ -85,7 +90,7 @@ async def run(args: argparse.Namespace) -> None:
         while True:
             try:
                 comment = await asyncio.wait_for(queue.get(), timeout=0.5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 if stop.is_set() and queue.empty():
                     logger.info("worker-%d exiting (queue drained)", worker_id)
                     return

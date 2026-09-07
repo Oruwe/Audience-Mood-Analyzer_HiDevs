@@ -3,14 +3,21 @@
 legacy non-JSON leftovers from the emotional_drivers / embedding columns.
 
 Run from the repo root AFTER applying the hardened reader in storage/db.py:
-    python repair_warehouse.py
+    python scripts/maintenance/repair_warehouse.py
 """
 
 from __future__ import annotations
 
-import duckdb
+import sys
+from pathlib import Path
 
-import storage.db as db
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import duckdb  # noqa: E402
+
+import storage.db as db  # noqa: E402
 
 
 def main() -> None:

@@ -1,5 +1,8 @@
 # Audience Mood Analyzer — V2
 
+[![CI](https://github.com/Oruwe/Audience-Mood-Analyzer_HiDevs/actions/workflows/ci.yml/badge.svg)](https://github.com/Oruwe/Audience-Mood-Analyzer_HiDevs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Real-time social-listening platform with a decoupled three-process
 architecture: an asyncio pipeline ingests and analyses the firehose, a FastAPI
 service owns every read of the DuckDB warehouse, and a Streamlit Operations
@@ -71,12 +74,29 @@ Live mode: `python pipeline.py --mode live --keywords ai tech marketing`
 ## Tooling
 
 ```sh
-python -m evals.benchmark     # sentiment benchmark -> data/eval_metrics.json
-python run_test.py            # hermetic contract tests (no network, no cost)
-python debug_models.py        # verify both providers respond
-python recover_legacy.py      # restore archived pre-migration warehouse rows
-curl http://127.0.0.1:8000/health   # API smoke test
+python -m evals.benchmark                       # sentiment benchmark -> data/eval_metrics.json
+pytest                                          # hermetic unit tests (no network, no cost)
+python scripts/check_providers.py               # verify both providers respond
+python scripts/maintenance/recover_legacy.py    # restore archived pre-migration warehouse rows
+python scripts/maintenance/repair_warehouse.py  # re-serialize rows through the hardened reader
+curl http://127.0.0.1:8000/health               # API smoke test
 ```
+
+## Development
+
+```sh
+pip install -r requirements-dev.txt   # adds pytest, pytest-asyncio, ruff on top of the app deps
+ruff check .                          # lint
+pytest -q                             # 67 hermetic tests: normalizer, dedup, engine, storage, API
+```
+
+CI (`.github/workflows/ci.yml`) runs both on every push/PR to `main`. Neither
+touches a real Gemini/Groq/Langfuse endpoint or a shared DuckDB file — every
+test that needs a provider response stubs it, and every test that needs a
+warehouse gets its own `tmp_path` DuckDB file, so the suite has no network
+dependency and no API cost. `python -m evals.benchmark` is intentionally not
+part of CI: it calls the real providers to score live model accuracy, which
+needs API keys and isn't hermetic by design.
 
 ## Guarantees
 
@@ -86,3 +106,7 @@ curl http://127.0.0.1:8000/health   # API smoke test
 - Tiered provider failover with structured-output validation.
 - Schema upgrades archive legacy tables automatically; readers trigger best-effort migration.
 - The console holds **no** database credentials — all access flows through the API.
+
+## License
+
+[MIT](LICENSE)

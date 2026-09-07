@@ -2,7 +2,7 @@
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import numpy as np
 
@@ -48,7 +48,7 @@ async def detect_anomalies(window_minutes: int = 15) -> CrisisAlert | None:
     logger.warning("anomaly detected: %s | %s", theme, reason)
     return CrisisAlert(
         alert_id=f"alert-{uuid.uuid4().hex[:12]}",
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
         severity=severity,
         theme=theme,
         trigger_reason=reason,

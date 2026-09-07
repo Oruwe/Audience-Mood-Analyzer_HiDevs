@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlencode
 
 import websockets
@@ -58,7 +58,7 @@ def _to_raw_comment(msg: JetstreamMessage) -> RawComment:
     if commit.record.createdAt:
         ts = datetime.fromisoformat(commit.record.createdAt.replace("Z", "+00:00"))
     else:
-        ts = datetime.fromtimestamp(msg.time_us / 1_000_000, tz=timezone.utc)
+        ts = datetime.fromtimestamp(msg.time_us / 1_000_000, tz=UTC)
     return RawComment(
         id=f"bsky:{msg.did}:{commit.rkey}",
         platform="bluesky",

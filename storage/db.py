@@ -212,7 +212,7 @@ def _parse_jsonish(raw: object, fallback: object) -> object:
 def _rows_to_records(rows: list[tuple]) -> list[EnrichedCommentRecord]:
     records: list[EnrichedCommentRecord] = []
     for row in rows:
-        data = dict(zip(_COLUMNS, row))
+        data = dict(zip(_COLUMNS, row, strict=True))
         data["emotional_drivers"] = _parse_jsonish(data["emotional_drivers"], [])
         data["embedding"] = _parse_jsonish(data["embedding"], None)
         records.append(EnrichedCommentRecord(**data))

@@ -1,13 +1,13 @@
 """Pydantic schemas shared across ingestion, analysis, and storage layers."""
 
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 
-class Sentiment(str, Enum):
+class Sentiment(StrEnum):
     STRONGLY_POSITIVE = "strongly_positive"
     POSITIVE = "positive"
     NEUTRAL = "neutral"
@@ -15,7 +15,7 @@ class Sentiment(str, Enum):
     CRITICAL_ESCALATION = "critical_escalation"
 
 
-class PrimaryIntent(str, Enum):
+class PrimaryIntent(StrEnum):
     BUG_REPORT = "bug_report"
     FEATURE_REQUEST = "feature_request"
     PRICING_COMPLAINT = "pricing_complaint"
@@ -25,7 +25,7 @@ class PrimaryIntent(str, Enum):
     SARCASTIC_TROLL = "sarcastic_troll"
 
 
-class RecommendedAction(str, Enum):
+class RecommendedAction(StrEnum):
     IGNORE = "ignore"
     COMMUNITY_REPLY = "community_reply"
     ESCALATE_TO_SUPPORT = "escalate_to_support"
@@ -66,13 +66,13 @@ class EnrichedCommentRecord(DeepMoodAnalysis):
     cluster_id: int | None = None
     latency_ms: float | None = None
     model_used: str | None = None
-    processed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    processed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class CrisisAlert(BaseModel):
     """Phase 4: anomaly-radar output for a detected urgency surge."""
     alert_id: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     severity: Literal["WARNING", "CRITICAL"]
     theme: str = Field(description="3-word summary of the issue")
     trigger_reason: str

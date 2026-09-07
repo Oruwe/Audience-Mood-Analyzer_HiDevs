@@ -10,8 +10,8 @@ already tolerates missing embeddings and cluster ids).
 Stop the pipeline before running — DuckDB permits only one writer.
 
 Usage (from repo root):
-    python recover_legacy.py           # copy rows, keep the archives
-    python recover_legacy.py --drop    # copy rows, then drop recovered archives
+    python scripts/maintenance/recover_legacy.py           # copy rows, keep the archives
+    python scripts/maintenance/recover_legacy.py --drop    # copy rows, then drop archives
 
 Exit code 0 = nothing to do, or every archive recovered cleanly;
 exit code 1 = at least one archive could not be recovered.
@@ -23,13 +23,13 @@ import argparse
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import duckdb  # noqa: E402
 
-from storage.db import DB_PATH, _COLUMNS  # noqa: E402
+from storage.db import _COLUMNS, DB_PATH  # noqa: E402
 
 
 def _list_archive_tables(conn: duckdb.DuckDBPyConnection) -> list[str]:

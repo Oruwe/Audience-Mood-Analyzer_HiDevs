@@ -17,7 +17,7 @@ import asyncio
 import json
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Make repo-root imports work regardless of how the script is launched.
@@ -73,7 +73,7 @@ async def evaluate_case(
             platform=case["platform"],
             text=case["text"],
             author_id="eval_harness",
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
         )
         try:
             analyzed = await analyze_comment(comment)
@@ -111,7 +111,7 @@ async def run_benchmark() -> None:
     failed = [r for r in results if r.error is not None]
 
     metrics: dict = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "total_cases": len(cases),
         "failed_cases": len(failed),
         "labels": COARSE_LABELS,
@@ -147,7 +147,7 @@ async def run_benchmark() -> None:
             print(classification_report(
                 y_true, y_pred, labels=COARSE_LABELS, digits=3, zero_division=0))
             print(f"Confusion matrix (rows=true, cols=predicted): {COARSE_LABELS}")
-            for label, row in zip(COARSE_LABELS, cm.tolist()):
+            for label, row in zip(COARSE_LABELS, cm.tolist(), strict=True):
                 print(f"  {label:<9}{row}")
 
         mixed_correct = sum(1 for p in mixed_preds if p in {"positive", "negative"})
