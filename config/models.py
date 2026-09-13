@@ -33,19 +33,46 @@ or too failure-prone, the fix is a one-line swap back to a paid string
 here — same "bake-off is a two-line edit" property this file was already
 designed around.
 
---- Stage A sentiment moved back to a paid model (2026-09-13, same day) ---
-That predicted failure mode showed up the same day, measured live: a real
-analysis spent 6+ minutes in Stage A alone, hitting the same
-"upstream_provider_shared_pool" 429 on effectively every batch. Stage A is
-the highest-volume stage (100% of comments, not a filtered subset), so
-it's also the one where free-tier throttling costs the most wall-clock
-time. The operator explicitly asked for lower latency and approved paying
-for Stage A specifically (Stage B/C stay free — much lower call volume,
-so the same throttling risk costs far less time there). STAGE_A_SENTIMENT
-below is a paid model again; STAGE_A_SENTIMENT_FALLBACK stays a free model
--- cheap insurance against a genuine outage on the (now much more
-reliable, dedicated-capacity) paid primary, not the primary defense it was
-when the primary was itself free.
+--- All four stages moved back to paid models (2026-09-13, same day) ---
+That predicted failure mode showed up the same day, measured live, and was
+reversed in two steps as evidence came in rather than all at once:
+
+Step 1 (Stage A): a real analysis spent 6+ minutes in Stage A alone,
+hitting "upstream_provider_shared_pool" 429s on effectively every batch.
+Stage A is the highest-volume stage (100% of comments), so free-tier
+throttling costs the most wall-clock time there. The operator approved
+paying for Stage A specifically, on the reasoning that Stage B/C's much
+lower call volume made the same risk cheaper to carry there.
+
+Step 2 (everything else): that reasoning was wrong, and the logs said so
+within minutes. With Stage A fast, the same analysis simply moved its
+stall into Stage B, which hit the identical shared-pool 429 on nearly
+every batch. Volume was never what made a stage slow — sharing a capacity
+pool with every other free user of that model was. All four stages are
+now paid, chosen for latency as much as price (~$0.01-0.18 per M tokens
+each; a full analysis costs well under a cent), on four *different*
+vendors so no single provider's capacity event can stall more than one
+stage.
+
+The *_FALLBACK constants stay on free models on purpose: they are
+insurance against a genuine outage of a paid primary, not the normal path.
+
+--- Why not the local encoder SPEC §4.1 originally specified? (2026-09-13) ---
+Asked directly, and worth recording since every failure above is exactly
+what §4.1 predicted would happen once Stage A left the encoder. The
+encoder is still the better architecture in principle — deterministic,
+no quota, injection-immune — but not on this deployment: Render's free
+plan gives this service 512 MB RAM and 0.1 CPU, and the running app
+already sits at ~440 MB of that. PyTorch alone is ~300-500 MB resident
+before any weights load; a base-size sentiment encoder is another ~1.1 GB.
+Even ONNX Runtime with int8-quantized MiniLM (~150-200 MB) doesn't fit the
+~65 MB of headroom. And 0.1 CPU would make encoder inference over a few
+hundred comments slower than the API calls it replaced, since a paid
+endpoint runs on the provider's GPU rather than a tenth of a shared core.
+So the encoder's "free and fast" inverts to "needs a $25/mo instance
+upgrade and is slower" here, versus ~$0.01 per analysis paid. Revisit this
+the day the app runs somewhere with >=2 GB RAM and a real core — SPEC
+§11.1's whole point is that switching back is a few lines in this file.
 
 --- Stage A architecture deviation from SPEC.md §4.1 (recorded 2026-09-13) ---
 SPEC §4.1 locks Stage A to a local, free, deterministic encoder, for four
@@ -100,27 +127,20 @@ STAGE_A_SENTIMENT = "openrouter/mistralai/mistral-nemo"
 # capacity is the actual point of paying here, not the price itself,
 # which is still effectively noise for a five-way classification task.
 
-STAGE_A_EMBEDDINGS = "openrouter/liquid/lfm-2.5-embedding-350m:free"
+STAGE_A_EMBEDDINGS = "openrouter/qwen/qwen3-embedding-0.6b"
 EMBEDDING_DIM = 1024
-# litellm's cost map has zero openrouter/* embedding-mode entries at any
-# price (confirmed against a fresh 2026-09-13 pull), so unlike the other
-# three stages this pick could not be sourced or cross-checked from that
-# registry — it's confirmed only via openrouter.ai's own model page
-# (openrouter.ai/liquid/lfm-2.5-embedding-350m:free; openrouter.ai is
-# unreachable from this build sandbox, so this is a web-search result, not
-# a call this build has made itself). Chosen because it's the one free
-# OpenRouter embedding model that documents 1,024-dimension output,
-# matching EMBEDDING_DIM without a re-derivation — but that dimension, and
-# the model's existence/behavior at all, is UNVERIFIED against a live API
-# response from this build. The model page also documents a 512-token
-# input cap per text, well under this stage's per-comment inputs in
-# practice but unenforced here — a comment longer than that may be
-# silently truncated by the provider rather than rejected; SPEC §11's
-# real eval pass should check this before this product is trusted with a
-# real creator's channel. The previously-configured paid alternative
-# (qwen/qwen3-embedding-0.6b, ~$0.01/M tokens) was already negligible cost
-# and is not the reason this changed — it changed because the operator
-# asked for $0 spend on every stage, embeddings included.
+# Back to the paid pick this stage originally shipped with (~$0.01/M
+# tokens), reverting the free swap for the same measured-latency reason as
+# STAGE_A_SENTIMENT above. Two things make this the low-risk revert rather
+# than a fresh guess: its 1,024-dimension output already matches
+# EMBEDDING_DIM (no re-derivation, no re-embed of anything), and the bug
+# that made it look broken the first time was never the model -- it was
+# engine/stage_a.py sending litellm's `openrouter/` routing prefix to
+# OpenRouter's own REST endpoint, fixed there by `_openrouter_model_id`
+# and covered by tests. Note litellm's cost map still has zero
+# openrouter/* embedding-mode entries at any price, so unlike the three
+# chat stages this price is from openrouter.ai's model page, not the
+# registry -- it is not automatically tracked if OpenRouter changes it.
 
 # ---------------------------------------------------------------------------
 # Stage B / C — OpenRouter, generative (SPEC §4.1, §7, §11)
@@ -148,20 +168,21 @@ STAGE_B_CLASSIFY_FALLBACK = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
 # something else once one of these two stages actually needs it live and
 # a genuinely distinct pick can be chosen with real evidence.
 
-STAGE_B_CLASSIFY = "openrouter/google/gemma-4-31b-it:free"
+STAGE_B_CLASSIFY = "openrouter/qwen/qwen3.7-flash"
 # Role: batched classification of the Stage-A-flagged subset (~10-20% of
-# comments, 40-60 per call) — intent / is_request / is_confusion. This
-# was this constant's *fallback* until a live incident (2026-09-13): the
-# original primary, minimax/minimax-m2.7:free, started 404ing --
-# OpenRouter's own error said the free slug had been withdrawn entirely
-# ("This model is unavailable for free ... use this slug instead:
-# minimax/minimax-m2.7" -- the paid one), not rate-limited, a permanent
-# condition no retry or fallback-then-recover would fix. Promoted this
-# already-configured, already-verified-live fallback to primary rather
-# than guess at a new one blind, since OpenRouter's free catalogue is
-# evidently shifting under this build in real time (this changed within
-# the same session the picks were first made) -- config/models.py's whole
-# point (SPEC §11.1) is that this stays a one-line swap, not a rewrite.
+# comments, 40-60 per call) — intent / is_request / is_confusion. Paid, for
+# the third and last time this file has had to record the same lesson: the
+# free predecessor (google/gemma-4-31b-it:free, itself promoted after
+# minimax/minimax-m2.7:free was withdrawn from the free tier mid-session)
+# hit "upstream_provider_shared_pool" 429s on effectively every batch of a
+# real analysis, falling back on each one. The "Stage B is lower volume so
+# throttling costs less time there" assumption in this file's Stage A note
+# above was measured and found wrong -- once Stage A was fast, Stage B
+# became the bottleneck instead. $0.03/$0.13 per M tokens; a "flash"-class
+# model, picked for latency as much as price, from litellm's cost map
+# filtered to paid `openrouter/*` chat models declaring
+# supports_response_schema. Different vendor (Qwen) from Stage A's Mistral,
+# so one provider's capacity event can't stall both stages at once.
 
 STAGE_C_SYNTHESIS_FALLBACK = "openrouter/minimax/minimax-m3:free"
 # Same shared-pool-exhaustion risk, lowest-probability of the three
@@ -170,23 +191,24 @@ STAGE_C_SYNTHESIS_FALLBACK = "openrouter/minimax/minimax-m3:free"
 # last stage, after every other stage already succeeded. Different vendor
 # (MiniMax) from the primary (Z-AI/GLM).
 
-STAGE_C_SYNTHESIS = "openrouter/z-ai/glm-5.2:free"
+STAGE_C_SYNTHESIS = "openrouter/deepseek/deepseek-v4-flash-0731"
 # Role: one call per cluster (capped at 8) producing an insight block and
-# selecting verbatim quotes. At ~8 calls per analysis this was previously
-# picked on capability alone since price was noise (SPEC §11: "pick Stage C
-# on quality") — with cost now fixed at $0 across the whole free set,
-# that same "pick on capability" logic points at GLM's flagship free
-# entry: it's the frontier-class model in the free+schema-capable set
-# (openrouter/openrouter/auto and openrouter/openrouter/free were also
-# available but were rejected here — they're OpenRouter's own dynamic
-# meta-routers, not a pinned model, which would silently reintroduce the
-# non-determinism this project already gave up once for Stage A; a fixed
-# string keeps this stage swappable-and-testable the same way as the
-# other three). 256,000-token context, well beyond one cluster's worth of
-# comments plus schema.
+# selecting verbatim quotes. Paid, alongside Stage A/B -- at ~8 calls per
+# analysis the free tier's throttling risk was the lowest here, but it was
+# never zero, and one un-recoverable stall at the very last stage fails a
+# report every earlier stage already paid for. SPEC §11 says "pick Stage C
+# on quality, price is noise at ~8 calls"; within the paid set that still
+# leaves room to prefer a fast one, since this stage is now on the
+# critical path of a <40s latency target. $0.065/$0.18 per M tokens, a
+# "flash"-class model with a 1.3M-token context (far beyond one cluster
+# plus schema), and a third distinct vendor (DeepSeek) after Stage A's
+# Mistral and Stage B's Qwen -- no two stages share a provider, so no
+# single capacity event can stall more than one.
 #
-# All three generative stages above (and Stage A embeddings, sourced
-# separately — see its own comment) are free-tier, per the operator's
-# explicit "use a free model" request covering every stage. See this
-# file's module docstring for the accepted-tradeoff record on that
-# decision.
+# All four stages are now paid. The free-tier experiment recorded in this
+# file's module docstring ran for one session and was reversed stage by
+# stage as each one's throttling was measured live rather than predicted.
+# The *_FALLBACK constants deliberately stay on free models: they are
+# insurance against a genuine outage of a paid primary, not the normal
+# path, so their rate limits cost nothing until the day they're the only
+# thing still answering.
