@@ -67,6 +67,32 @@ def test_scoring_and_metrics_file_with_a_stubbed_classifier(monkeypatch, tmp_pat
     assert written["mixed_covered"] == 1
 
 
+def test_persist_to_file_false_returns_metrics_without_writing(monkeypatch, tmp_path):
+    """app.py's run_and_persist_eval calls this with persist_to_file=False
+    (it persists to Postgres instead) — the metrics dict must still come
+    back complete, just without touching the filesystem."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+    metrics_path = tmp_path / "eval_metrics.json"
+    monkeypatch.setattr(benchmark, "METRICS_PATH", metrics_path)
+
+    cases = [{"text": "great!", "platform": "youtube", "expected_mood": "positive"}]
+    monkeypatch.setattr(benchmark, "load_dataset", lambda: cases)
+
+    async def fake_classify_all_sentiments(comments, *, api_key, model=None):
+        return {
+            benchmark._comment_id(0): StageASentimentItem(
+                comment_id=benchmark._comment_id(0), sentiment=Sentiment.POSITIVE, confidence=0.9
+            )
+        }
+
+    monkeypatch.setattr(benchmark, "classify_all_sentiments", fake_classify_all_sentiments)
+
+    result = asyncio.run(benchmark.run_benchmark(persist_to_file=False))
+
+    assert result["accuracy"] == 1.0
+    assert not metrics_path.exists()
+
+
 def test_partial_failure_is_recorded_not_silently_dropped(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
     metrics_path = tmp_path / "eval_metrics.json"

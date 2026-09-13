@@ -23,11 +23,14 @@ from storage.postgres import (
     get_batch_results,
     get_completed_batch_keys,
     get_job_progress,
+    get_latest_eval_run,
+    get_stage_checkpoint_summary,
     increment_completed_units,
     init_schema,
     is_cancel_requested,
     record_batch_result,
     request_cancellation,
+    save_eval_run,
     update_job_progress,
 )
 
@@ -229,3 +232,70 @@ def test_batch_checkpoints_are_scoped_per_stage(pg_dsn):
     a, b = _run(scenario())
     assert a == {"batch-0"}
     assert b == {"batch-0"}
+
+
+# ---------------------------------------------------------------------------
+# get_stage_checkpoint_summary / save_eval_run / get_latest_eval_run --
+# evaluation-criteria support (Real-Time Efficiency's stage-timing chart,
+# Metrics Usage's persisted accuracy benchmark).
+# ---------------------------------------------------------------------------
+
+def test_stage_checkpoint_summary_counts_and_latest_timestamp_per_stage(pg_dsn):
+    async def scenario():
+        conn, job_id = await _fresh_job(pg_dsn)
+        try:
+            await record_batch_result(conn, job_id, "ingestion", "v1", result={"n": 1})
+            await record_batch_result(conn, job_id, "ingestion", "v2", result={"n": 1})
+            await record_batch_result(conn, job_id, "stage_c", "insights", result={"n": 1})
+            # A failed checkpoint must not count toward the summary.
+            await record_batch_result(conn, job_id, "stage_b", "batch-0", error="boom")
+            return await get_stage_checkpoint_summary(conn, job_id)
+        finally:
+            await conn.close()
+
+    summary = _run(scenario())
+    assert summary["ingestion"]["n"] == 2
+    assert summary["stage_c"]["n"] == 1
+    assert "stage_b" not in summary
+    assert summary["ingestion"]["last_at"] is not None
+    assert summary["stage_c"]["last_at"] is not None
+
+
+def test_stage_checkpoint_summary_empty_for_a_job_with_no_checkpoints(pg_dsn):
+    async def scenario():
+        conn, job_id = await _fresh_job(pg_dsn)
+        try:
+            return await get_stage_checkpoint_summary(conn, job_id)
+        finally:
+            await conn.close()
+
+    assert _run(scenario()) == {}
+
+
+def test_eval_run_round_trips_and_latest_wins(pg_dsn):
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            await save_eval_run(conn, {"accuracy": 0.5, "generated_at": "t1"})
+            await save_eval_run(conn, {"accuracy": 0.9, "generated_at": "t2"})
+            return await get_latest_eval_run(conn)
+        finally:
+            await conn.close()
+
+    latest = _run(scenario())
+    assert latest["accuracy"] == 0.9
+    assert latest["generated_at"] == "t2"
+
+
+def test_get_latest_eval_run_none_when_table_is_empty(pg_dsn):
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            await conn.execute("DELETE FROM model_eval_runs")
+            return await get_latest_eval_run(conn)
+        finally:
+            await conn.close()
+
+    assert _run(scenario()) is None

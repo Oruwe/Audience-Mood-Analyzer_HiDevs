@@ -17,6 +17,12 @@ is 1-2 sentiment batches now, not 30 individual rate-limited calls.
 
 Usage (from repo root):
     python -m evals.benchmark
+
+Also importable and callable directly with `persist_to_file=False` — app.py's
+"Model accuracy benchmark" panel does exactly this, running the same real
+benchmark against the live deployed model on demand and persisting the
+result to Postgres (storage.postgres.save_eval_run) instead of a file, so
+it survives a redeploy/restart the same way SPEC §8 job state already does.
 """
 
 from __future__ import annotations
@@ -72,7 +78,7 @@ def _comment_id(index: int) -> str:
     return f"eval-{index:03d}"
 
 
-async def run_benchmark() -> None:
+async def run_benchmark(*, persist_to_file: bool = True) -> dict:
     cases = load_dataset()
     print("=== SPEC §11 Track 1: Stage A sentiment benchmark ===")
     print(f"Loaded {len(cases)} cases from {DATASET_PATH}")
@@ -174,9 +180,11 @@ async def run_benchmark() -> None:
         if error:
             metrics["error"] = error  # partial-failure case: some results, some not
 
-    METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    METRICS_PATH.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    print(f"Metrics saved -> {METRICS_PATH}")
+    if persist_to_file:
+        METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        METRICS_PATH.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        print(f"Metrics saved -> {METRICS_PATH}")
+    return metrics
 
 
 if __name__ == "__main__":

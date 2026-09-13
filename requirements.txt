@@ -13,6 +13,7 @@ asyncpg
 # UI & Evals
 streamlit
 streamlit-autorefresh
+altair>=5.0  # in-app charts (mood distribution, confusion matrix, stage timing) -- ships with streamlit anyway, listed explicitly since app.py imports it directly
 pandas>=2.2.2
 numpy>=2.1
 scipy>=1.14

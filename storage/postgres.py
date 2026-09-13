@@ -76,6 +76,17 @@ CREATE TABLE IF NOT EXISTS analysis_job_batches (
 -- instead of spending quota again.
 CREATE INDEX IF NOT EXISTS idx_analysis_jobs_cache_lookup
     ON analysis_jobs (channel_ref, total_comment_count, status, created_at DESC);
+
+-- Evaluation-criteria support ("Metrics Usage"): the last few times someone
+-- clicked "Run live accuracy benchmark" in the app (app.py), so the result
+-- survives a page reload/restart instead of living only in one Streamlit
+-- session's memory. `metrics` is the same dict evals/benchmark.py already
+-- produces and would otherwise only write to data/eval_metrics.json.
+CREATE TABLE IF NOT EXISTS model_eval_runs (
+    id         BIGSERIAL PRIMARY KEY,
+    metrics    JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -356,3 +367,43 @@ async def get_batch_results(
         job_id, stage,
     )
     return {r["batch_key"]: json.loads(r["result"]) for r in rows}
+
+
+async def get_stage_checkpoint_summary(
+    conn: asyncpg.Connection, job_id: str
+) -> dict[str, dict]:
+    """Per-stage checkpoint count and latest `completed_at` for *job_id* --
+    the raw material app.py's `stage_durations_seconds` uses to derive an
+    approximate stage-by-stage timing breakdown for the "Real-Time
+    Efficiency" chart. Not a dedicated per-stage timer (SPEC §8 only
+    requires a checkpoint per unit of work, not a profiler) — just what
+    those checkpoints' own timestamps already tell us for free.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT stage, MAX(completed_at) AS last_at, COUNT(*) AS n
+        FROM analysis_job_batches
+        WHERE job_id = $1 AND status = 'completed'
+        GROUP BY stage
+        """,
+        job_id,
+    )
+    return {r["stage"]: {"last_at": r["last_at"], "n": r["n"]} for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Model evaluation runs ("Metrics Usage" — see the module's schema comment)
+# ---------------------------------------------------------------------------
+
+async def save_eval_run(conn: asyncpg.Connection, metrics: dict) -> None:
+    await conn.execute(
+        "INSERT INTO model_eval_runs (metrics) VALUES ($1::jsonb)",
+        json.dumps(metrics),
+    )
+
+
+async def get_latest_eval_run(conn: asyncpg.Connection) -> dict | None:
+    row = await conn.fetchrow(
+        "SELECT metrics FROM model_eval_runs ORDER BY created_at DESC LIMIT 1"
+    )
+    return json.loads(row["metrics"]) if row is not None else None
