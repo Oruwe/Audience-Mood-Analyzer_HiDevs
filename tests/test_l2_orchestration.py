@@ -14,7 +14,14 @@ import pytest
 
 import orchestration
 from ingestion.youtube import ChannelInfo, QuotaEstimate, VideoMeta
-from schemas import CommentIntent, RawComment, Sentiment, StageASentimentItem, StageBClassificationItem
+from schemas import (
+    ChannelInsights,
+    CommentIntent,
+    RawComment,
+    Sentiment,
+    StageASentimentItem,
+    StageBClassificationItem,
+)
 from storage.postgres import get_job_progress, init_schema
 import asyncpg
 
@@ -70,11 +77,17 @@ def _install_happy_path_mocks(monkeypatch, *, video_specs, calls):
             for c in batch
         }
 
+    async def fake_build_channel_insights(comments, sentiments, stage_b, embeddings, video_titles, *, api_key, model=None):
+        calls.setdefault("insights_calls", 0)
+        calls["insights_calls"] += 1
+        return ChannelInsights(requests=[], confusion_points=[], video_moods=[])
+
     monkeypatch.setattr(orchestration, "estimate_channel_analysis", fake_estimate)
     monkeypatch.setattr(orchestration, "fetch_video_comments", fake_fetch_video_comments)
     monkeypatch.setattr(orchestration, "classify_sentiment_batch", fake_classify_sentiment_batch)
     monkeypatch.setattr(orchestration, "embed_comments_batch", fake_embed_comments_batch)
     monkeypatch.setattr(orchestration, "stage_b_classify_batch", fake_stage_b_classify_batch)
+    monkeypatch.setattr(orchestration, "build_channel_insights", fake_build_channel_insights)
 
 
 def _run(coro):
@@ -109,6 +122,8 @@ def test_analyze_channel_happy_path(monkeypatch, pg_dsn):
     # all comments are high-confidence (0.9) -> all flagged for Stage B
     assert set(result.stage_b.keys()) == {c.id for c in result.comments}
     assert calls["fetch_video"] == ["v1", "v2"]
+    assert isinstance(result.insights, ChannelInsights)
+    assert calls["insights_calls"] == 1
 
 
 def test_resuming_skips_already_checkpointed_ingestion(monkeypatch, pg_dsn):
@@ -147,6 +162,8 @@ def test_resuming_skips_already_checkpointed_ingestion(monkeypatch, pg_dsn):
     assert calls["fetch_video"] == ["v1", "v2"]
     # No new sentiment batches either.
     assert len(calls["sentiment_batches"]) == first_sentiment_calls
+    # Stage C (checkpointed as a single unit) also isn't recomputed.
+    assert calls["insights_calls"] == 1
 
 
 def test_cancellation_stops_the_job_between_stages(monkeypatch, pg_dsn):

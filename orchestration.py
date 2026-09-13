@@ -1,10 +1,12 @@
 """SPEC §8 — Orchestration.
 
-`analyze_channel(job_id, channel_ref)` composes the pipeline built so far
-— ingestion -> Stage A (sentiment + embeddings) -> the Stage A/B filter ->
-Stage B classification — as one checkpointed, cancellable, resumable job.
-Stage C (engine/insights.py, Phase 7) plugs in as one more checkpointed
-stage once it exists; this function's shape doesn't change.
+`analyze_channel(job_id, channel_ref)` composes the full pipeline —
+ingestion -> Stage A (sentiment + embeddings) -> the Stage A/B filter ->
+Stage B classification -> Stage C synthesis (engine/insights.py) — as one
+checkpointed, cancellable, resumable job. Stage C is checkpointed as a
+single unit (not per-cluster like Stage A/B's chunks): it's only ~8 calls,
+cheap enough that re-running the whole thing on resume isn't worth the
+extra bookkeeping a finer-grained scheme would need.
 
 Replaces pipeline.py (SPEC §2 cut: "3-process firehose runner + token
 bucket — replaced by a request-scoped job"). This is that job.
@@ -44,6 +46,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from engine.insights import build_channel_insights
 from engine.llm_client import DEFAULT_BATCH_SIZE as STAGE_B_BATCH_SIZE
 from engine.llm_client import classify_batch as stage_b_classify_batch
 from engine.stage_a import (
@@ -60,7 +63,7 @@ from ingestion.youtube import (
     estimate_channel_analysis,
     fetch_video_comments,
 )
-from schemas import RawComment, StageASentimentItem, StageBClassificationItem
+from schemas import ChannelInsights, RawComment, StageASentimentItem, StageBClassificationItem
 from storage.postgres import (
     claim_job,
     connect,
@@ -82,6 +85,8 @@ STAGE_INGESTION = "ingestion"
 STAGE_SENTIMENT = "stage_a_sentiment"
 STAGE_EMBEDDING = "stage_a_embedding"
 STAGE_CLASSIFY = "stage_b"
+STAGE_INSIGHTS = "stage_c"
+_INSIGHTS_BATCH_KEY = "insights"  # Stage C is checkpointed as a single unit -- see module docstring
 
 
 class JobCancelledError(RuntimeError):
@@ -96,6 +101,7 @@ class AnalysisResult:
     sentiments: dict[str, StageASentimentItem]
     embeddings: dict[str, list[float]]
     stage_b: dict[str, StageBClassificationItem]
+    insights: ChannelInsights
 
 
 async def _check_cancel(conn, job_id: str) -> None:
@@ -197,6 +203,26 @@ def _n_batches(n_items: int, batch_size: int) -> int:
     return -(-n_items // batch_size) if n_items else 0
 
 
+async def _run_stage_c(
+    conn, job_id: str, comments, sentiments, stage_b_results, embeddings, video_titles,
+    *, api_key: str,
+) -> ChannelInsights:
+    """Stage C, checkpointed as one unit (see module docstring)."""
+    done = await get_completed_batch_keys(conn, job_id, STAGE_INSIGHTS)
+    if _INSIGHTS_BATCH_KEY in done:
+        cached = await get_batch_results(conn, job_id, STAGE_INSIGHTS)
+        return ChannelInsights.model_validate(cached[_INSIGHTS_BATCH_KEY])
+
+    result = await build_channel_insights(
+        comments, sentiments, stage_b_results, embeddings, video_titles, api_key=api_key,
+    )
+    await record_batch_result(
+        conn, job_id, STAGE_INSIGHTS, _INSIGHTS_BATCH_KEY, result=result.model_dump(mode="json"),
+    )
+    await increment_completed_units(conn, job_id, by=1)
+    return result
+
+
 async def analyze_channel(
     job_id: str,
     channel_ref: str,
@@ -268,9 +294,18 @@ async def analyze_channel(
                 run_batch=lambda batch: stage_b_classify_batch(batch, api_key=openrouter_api_key),
             )
 
+            await _check_cancel(conn, job_id)
+            video_titles = {v.video_id: v.title for v in estimate.videos}
+            await update_job_progress(conn, job_id, stage=STAGE_INSIGHTS, total_units=1, completed_units=0)
+            insights = await _run_stage_c(
+                conn, job_id, comments, sentiments, stage_b_results, embeddings, video_titles,
+                api_key=openrouter_api_key,
+            )
+
     return AnalysisResult(
         job_id=job_id, channel_ref=channel_ref, comments=comments,
         sentiments=sentiments, embeddings=embeddings, stage_b=stage_b_results,
+        insights=insights,
     )
 
 

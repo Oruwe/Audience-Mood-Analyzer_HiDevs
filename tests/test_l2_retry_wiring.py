@@ -1,5 +1,6 @@
 """L2 contract tests — SPEC §8 retry wiring on the OpenRouter call sites
-(engine.batching's chat completion call, engine.stage_a's embeddings call).
+(engine.batching's chat completion call, engine.stage_a's embeddings call,
+engine.insights's Stage C synthesis call).
 
 Only the exception-classification + retry-until-success behavior;
 resilience.retry_transient's own mechanics are covered by
@@ -16,6 +17,7 @@ import pytest
 from litellm.exceptions import AuthenticationError, ServiceUnavailableError
 
 import engine.batching as batching
+import engine.insights as insights
 import engine.stage_a as stage_a
 from schemas import RawComment, StageASentimentBatch
 
@@ -109,4 +111,48 @@ def test_embeddings_does_not_retry_a_401():
 
     with pytest.raises(stage_a.EmbeddingAPIError):
         asyncio.run(scenario())
+    assert calls["count"] == 1
+
+
+def test_insights_stage_c_retries_a_transient_litellm_error(monkeypatch):
+    valid_json = json.dumps({
+        "theme": "Wants a Docker follow-up",
+        "quotes": ["a real quote", "another real quote"],
+        "suggested_title": "Docker 101",
+    })
+    calls = {"count": 0}
+
+    async def flaky_acompletion(**kwargs):
+        calls["count"] += 1
+        if calls["count"] < 2:
+            raise ServiceUnavailableError(message="try again", model="m", llm_provider="openrouter")
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=valid_json))]
+        )
+
+    monkeypatch.setattr(insights, "acompletion", flaky_acompletion)
+    from schemas import RequestInsightDraft
+
+    result = asyncio.run(insights._call_stage_c(
+        "openrouter/x", API_KEY, [{"role": "user", "content": "hi"}], RequestInsightDraft,
+    ))
+
+    assert calls["count"] == 2
+    assert result.choices[0].message.content == valid_json
+
+
+def test_insights_stage_c_does_not_retry_a_non_transient_error(monkeypatch):
+    calls = {"count": 0}
+
+    async def always_unauthenticated(**kwargs):
+        calls["count"] += 1
+        raise AuthenticationError(message="bad key", model="m", llm_provider="openrouter")
+
+    monkeypatch.setattr(insights, "acompletion", always_unauthenticated)
+    from schemas import RequestInsightDraft
+
+    with pytest.raises(AuthenticationError):
+        asyncio.run(insights._call_stage_c(
+            "openrouter/x", API_KEY, [{"role": "user", "content": "hi"}], RequestInsightDraft,
+        ))
     assert calls["count"] == 1
