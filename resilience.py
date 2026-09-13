@@ -48,19 +48,48 @@ DEFAULT_WAIT_MAX = 8.0          # seconds
 # NON_RETRYABLE_API_ERRORS is the opposite shape from an allow-list: every
 # `openai.APIError` is retryable EXCEPT these few, which mean a genuine,
 # permanent client mistake (bad key, malformed request, permission,
-# not-found, content-policy -- BadRequestError's own subclass) that
-# retrying or falling back to a different model would never fix.
+# content-policy -- BadRequestError's own subclass) that retrying the SAME
+# model would never fix.
+#
+# Live incident (2026-09-13, on top of the one above): a Stage B call
+# 404'd with "This model is unavailable for free ... use this slug
+# instead: minimax/minimax-m2.7" -- OpenRouter had withdrawn the specific
+# `:free` slug entirely, not rate-limited it. NotFoundError was originally
+# in this deny-list and shared by both retry and fallback decisions, which
+# meant the (correct) "don't retry the same now-nonexistent model" call
+# also (incorrectly) blocked ever falling back to a *different* model --
+# exactly the situation config.models' fallback constants exist for.
+# NotFoundError is therefore excluded from retry (below) but deliberately
+# NOT excluded from fallback (NON_FALLBACK_API_ERRORS, further down): the
+# other four types are about *our own request or account* (bad key,
+# malformed body, permission, content policy) and would fail identically
+# against any model, so falling back doesn't help those -- but "this model
+# doesn't exist/isn't available" is specific to the one model string, and
+# is exactly what trying a different one fixes.
 NON_RETRYABLE_API_ERRORS = (
     AuthenticationError, BadRequestError, NotFoundError,
     PermissionDeniedError, UnprocessableEntityError,
 )
 
+NON_FALLBACK_API_ERRORS = (
+    AuthenticationError, BadRequestError, PermissionDeniedError, UnprocessableEntityError,
+)
+
 
 def is_retryable_api_error(exc: BaseException) -> bool:
-    """True for an OpenAI/litellm API error worth retrying or falling back
-    to a different model on -- see NON_RETRYABLE_API_ERRORS above for why
-    this is a deny-list, not an allow-list of specific subclasses."""
+    """True for an OpenAI/litellm API error worth retrying the SAME model
+    on -- see NON_RETRYABLE_API_ERRORS above for why this is a deny-list,
+    not an allow-list of specific subclasses."""
     return isinstance(exc, openai.APIError) and not isinstance(exc, NON_RETRYABLE_API_ERRORS)
+
+
+def is_fallback_worthy_api_error(exc: BaseException) -> bool:
+    """True for an OpenAI/litellm API error worth falling back to a
+    *different* model on. Deliberately more permissive than
+    is_retryable_api_error: a NotFoundError ("this model/slug doesn't
+    exist or isn't available") is exactly what a different model fixes,
+    even though retrying the same one again obviously wouldn't."""
+    return isinstance(exc, openai.APIError) and not isinstance(exc, NON_FALLBACK_API_ERRORS)
 
 
 def retry_transient(

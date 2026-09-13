@@ -23,7 +23,7 @@ import openai
 from litellm import acompletion
 from pydantic import BaseModel, ValidationError
 
-from resilience import is_retryable_api_error, retry_transient_api_error
+from resilience import is_fallback_worthy_api_error, retry_transient_api_error
 from schemas import RawComment
 
 logger = logging.getLogger(__name__)
@@ -64,19 +64,23 @@ async def _call_model_with_fallback(
 ):
     """Try *models* in order, each already retried on its own transient
     errors by `_call_model` -- this only steps to the next model once a
-    given one has exhausted those retries. Added after a live incident
+    given one has exhausted those retries (or, for a NotFoundError, once
+    it's clear retrying it at all is pointless -- see
+    resilience.is_fallback_worthy_api_error). Added after a live incident
     (2026-09-13, config/models.py's fallback constants): a free OpenRouter
     model's 429 can be a *sustained* shared-pool exhaustion, not a
     momentary blip, and outlasts resilience.py's ~8s retry window. A
     second free model from a different vendor is unlikely to be exhausted
-    by the same event.
+    by the same event -- and, per a second live incident the same day, is
+    also the fix when OpenRouter has withdrawn the first one's `:free`
+    slug outright (a 404, not a rate limit).
     """
     last_exc: Exception | None = None
     for i, model in enumerate(models):
         try:
             return await _call_model(model, api_key, messages, response_schema)
         except openai.APIError as exc:
-            if not is_retryable_api_error(exc):
+            if not is_fallback_worthy_api_error(exc):
                 raise
             last_exc = exc
             if i + 1 < len(models):

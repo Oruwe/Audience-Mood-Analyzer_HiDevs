@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from litellm.exceptions import APIError, AuthenticationError, RateLimitError, ServiceUnavailableError
+from litellm.exceptions import APIError, AuthenticationError, NotFoundError, RateLimitError, ServiceUnavailableError
 
 import engine.batching as batching
 import engine.insights as insights
@@ -173,6 +173,74 @@ def test_batching_falls_back_on_a_bare_api_error_from_the_primary(monkeypatch):
     assert calls["model-a"] == 4  # exhausted every retry before falling back
     assert calls["model-b"] == 1
     assert result["c0"].sentiment.value == "positive"
+
+
+def test_batching_falls_back_immediately_on_a_not_found_error_without_retrying_it(monkeypatch):
+    """Live incident (2026-09-13): OpenRouter 404'd a withdrawn `:free`
+    slug -- "This model is unavailable for free ... use this slug
+    instead: ...". Retrying the same model is pointless (it's gone), but
+    falling back to a different one is exactly right, and should happen
+    on the FIRST attempt, not after retry_transient_api_error's usual
+    multi-attempt budget (NotFoundError isn't retryable, just
+    fallback-worthy -- see resilience.py).
+    """
+    calls = {"model-a": 0, "model-b": 0}
+    valid_json = json.dumps({
+        "results": [{"comment_id": "c0", "sentiment": "positive", "confidence": 0.9}]
+    })
+
+    async def fake_acompletion(*, model, **kwargs):
+        calls[model] += 1
+        if model == "model-a":
+            raise NotFoundError(
+                message="This model is unavailable for free ... use a different slug",
+                model=model, llm_provider="openrouter",
+            )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=valid_json))]
+        )
+
+    monkeypatch.setattr(batching, "acompletion", fake_acompletion)
+    result = asyncio.run(batching.run_batched_llm_classification(
+        [_comment(0)], api_key=API_KEY, model="model-a", system_prompt="sys",
+        response_schema=StageASentimentBatch, stage_label="test",
+        fallback_models=("model-b",),
+    ))
+
+    assert calls["model-a"] == 1  # not retried -- retrying a withdrawn model is pointless
+    assert calls["model-b"] == 1
+    assert result["c0"].sentiment.value == "positive"
+
+
+def test_insights_stage_c_falls_back_immediately_on_a_not_found_error(monkeypatch):
+    valid_json = json.dumps({
+        "theme": "Wants a Docker follow-up",
+        "quotes": ["a real quote", "another real quote"],
+        "suggested_title": "Docker 101",
+    })
+    calls = {"model-a": 0, "model-b": 0}
+
+    async def fake_acompletion(*, model, **kwargs):
+        calls[model] += 1
+        if model == "model-a":
+            raise NotFoundError(
+                message="This model is unavailable for free ... use a different slug",
+                model=model, llm_provider="openrouter",
+            )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=valid_json))]
+        )
+
+    monkeypatch.setattr(insights, "acompletion", fake_acompletion)
+    from schemas import RequestInsightDraft
+
+    result = asyncio.run(insights._call_stage_c_with_fallback(
+        ("model-a", "model-b"), API_KEY, [{"role": "user", "content": "hi"}], RequestInsightDraft,
+    ))
+
+    assert calls["model-a"] == 1
+    assert calls["model-b"] == 1
+    assert result.choices[0].message.content == valid_json
 
 
 def test_batching_falls_back_to_a_different_model_once_the_primary_is_exhausted(monkeypatch):

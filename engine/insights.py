@@ -33,7 +33,7 @@ from pydantic import BaseModel, ValidationError
 from sklearn.cluster import KMeans
 
 from config.models import STAGE_C_SYNTHESIS, STAGE_C_SYNTHESIS_FALLBACK
-from resilience import is_retryable_api_error, retry_transient_api_error
+from resilience import is_fallback_worthy_api_error, retry_transient_api_error
 from schemas import (
     ChannelInsights,
     ConfusionInsight,
@@ -107,18 +107,18 @@ async def _call_stage_c_with_fallback(
     models: tuple[str, ...], api_key: str, messages: list[dict], response_schema: type[BaseModel],
 ):
     """Same reasoning as engine.batching._call_model_with_fallback: a free
-    OpenRouter model's transient failure -- a 429, or (live incident,
-    2026-09-13) an "Nvidia: Service temporarily overloaded" surfaced as a
-    bare litellm.APIError -- can outlast _call_stage_c's own retries; try
-    the next model, from a different vendor, before giving up on this
-    cluster.
+    OpenRouter model's transient failure -- a 429, an "Nvidia: Service
+    temporarily overloaded" surfaced as a bare litellm.APIError, or a 404
+    because OpenRouter withdrew the `:free` slug entirely -- can mean this
+    model won't work at all; try the next one, from a different vendor,
+    before giving up on this cluster.
     """
     last_exc: Exception | None = None
     for i, model in enumerate(models):
         try:
             return await _call_stage_c(model, api_key, messages, response_schema)
         except openai.APIError as exc:
-            if not is_retryable_api_error(exc):
+            if not is_fallback_worthy_api_error(exc):
                 raise
             last_exc = exc
             if i + 1 < len(models):

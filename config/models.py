@@ -124,21 +124,29 @@ EMBEDDING_DIM = 1024
 # rather than a declared capability flag. Re-run that eval and swap these
 # strings before this product is trusted with a real creator's channel.
 
-STAGE_B_CLASSIFY_FALLBACK = "openrouter/google/gemma-4-31b-it:free"
-# Same shared-pool-exhaustion risk as STAGE_A_SENTIMENT_FALLBACK above,
-# lower-probability here only because Stage B sees a filtered subset
-# (~10-20% of comments) rather than 100% of them. Different vendor
-# (Google) from the primary (MiniMax) for the same reason.
+STAGE_B_CLASSIFY_FALLBACK = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+# Different vendor (Nvidia) from the new primary (Google) for the same
+# shared-pool-exhaustion reasoning as the other stages' fallbacks.
+# Overlaps with STAGE_A_SENTIMENT_FALLBACK (same model, different role) --
+# acceptable: it's a backup here, not a primary, and the alternative was
+# guessing at a third free slug with zero data behind the guess. Swap for
+# something else once one of these two stages actually needs it live and
+# a genuinely distinct pick can be chosen with real evidence.
 
-STAGE_B_CLASSIFY = "openrouter/minimax/minimax-m2.7:free"
+STAGE_B_CLASSIFY = "openrouter/google/gemma-4-31b-it:free"
 # Role: batched classification of the Stage-A-flagged subset (~10-20% of
-# comments, 40-60 per call) — intent / is_request / is_confusion. Picked
-# from the free+schema-capable set on context headroom (196,608 tokens,
-# comfortably oversized for a 60-comment batch) and general standing as a
-# mid-size, instruction-tuned model — the free-tier analogue of the old
-# "pick Stage B on schema reliability and cost" criterion (SPEC §11), with
-# cost now fixed at $0 across the whole free set and reliability the only
-# remaining axis to differentiate on.
+# comments, 40-60 per call) — intent / is_request / is_confusion. This
+# was this constant's *fallback* until a live incident (2026-09-13): the
+# original primary, minimax/minimax-m2.7:free, started 404ing --
+# OpenRouter's own error said the free slug had been withdrawn entirely
+# ("This model is unavailable for free ... use this slug instead:
+# minimax/minimax-m2.7" -- the paid one), not rate-limited, a permanent
+# condition no retry or fallback-then-recover would fix. Promoted this
+# already-configured, already-verified-live fallback to primary rather
+# than guess at a new one blind, since OpenRouter's free catalogue is
+# evidently shifting under this build in real time (this changed within
+# the same session the picks were first made) -- config/models.py's whole
+# point (SPEC §11.1) is that this stays a one-line swap, not a rewrite.
 
 STAGE_C_SYNTHESIS_FALLBACK = "openrouter/minimax/minimax-m3:free"
 # Same shared-pool-exhaustion risk, lowest-probability of the three
