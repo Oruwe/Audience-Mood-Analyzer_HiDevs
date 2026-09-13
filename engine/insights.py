@@ -24,6 +24,7 @@ to tune against):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import numpy as np
@@ -197,17 +198,23 @@ async def build_requests(
 ) -> list[RequestInsight]:
     """SPEC §3 Block 1 — what the audience is asking the creator to make."""
     candidates = [c for c in comments if stage_b.get(c.id) is not None and stage_b[c.id].is_request]
-    insights: list[RequestInsight] = []
-    for cluster in _cluster_comments(candidates, embeddings, max_clusters):
-        draft = await _synthesize(
+    clusters = _cluster_comments(candidates, embeddings, max_clusters)
+    # Independent clusters, independent calls -- run them concurrently
+    # rather than one-at-a-time (at most MAX_REQUEST_CLUSTERS=3, so this
+    # can't run away on a pathological input).
+    drafts = await asyncio.gather(*(
+        _synthesize(
             cluster, api_key=api_key, model=model,
             system_prompt=REQUEST_SYSTEM_PROMPT, draft_schema=RequestInsightDraft,
             fallback_models=fallback_models,
         )
-        if draft is None:
-            continue
-        insights.append(RequestInsight(**draft.model_dump(), mention_count=len(cluster)))
-    return insights
+        for cluster in clusters
+    ))
+    return [
+        RequestInsight(**draft.model_dump(), mention_count=len(cluster))
+        for cluster, draft in zip(clusters, drafts)
+        if draft is not None
+    ]
 
 
 async def build_confusion_points(
@@ -222,17 +229,20 @@ async def build_confusion_points(
 ) -> list[ConfusionInsight]:
     """SPEC §3 Block 2 — where the creator's explanation didn't land."""
     candidates = [c for c in comments if stage_b.get(c.id) is not None and stage_b[c.id].is_confusion]
-    insights: list[ConfusionInsight] = []
-    for cluster in _cluster_comments(candidates, embeddings, max_clusters):
-        draft = await _synthesize(
+    clusters = _cluster_comments(candidates, embeddings, max_clusters)
+    drafts = await asyncio.gather(*(
+        _synthesize(
             cluster, api_key=api_key, model=model,
             system_prompt=CONFUSION_SYSTEM_PROMPT, draft_schema=ConfusionInsightDraft,
             fallback_models=fallback_models,
         )
-        if draft is None:
-            continue
-        insights.append(ConfusionInsight(**draft.model_dump(), mention_count=len(cluster)))
-    return insights
+        for cluster in clusters
+    ))
+    return [
+        ConfusionInsight(**draft.model_dump(), mention_count=len(cluster))
+        for cluster, draft in zip(clusters, drafts)
+        if draft is not None
+    ]
 
 
 def _per_video_sentiment_stats(
@@ -282,8 +292,7 @@ async def build_video_moods(
     worst = sorted(stats.items(), key=lambda kv: kv[1]["delta_vs_channel_avg"])
     underperforming = [(vid, s) for vid, s in worst if s["delta_vs_channel_avg"] < 0][:max_videos]
 
-    insights: list[VideoMoodInsight] = []
-    for video_id, stat in underperforming:
+    async def _one(video_id: str, stat: dict):
         sample = sorted(
             stat["comments"], key=lambda c: _SENTIMENT_SCORE[sentiments[c.id].sentiment]
         )[:DRIVER_SAMPLE_SIZE]
@@ -293,15 +302,17 @@ async def build_video_moods(
             fallback_models=fallback_models,
         )
         if draft is None:
-            continue
-        insights.append(VideoMoodInsight(
+            return None
+        return VideoMoodInsight(
             video_title=video_titles.get(video_id, video_id),
             sentiment_score=stat["sentiment_score"],
             delta_vs_channel_avg=stat["delta_vs_channel_avg"],
             top_negative_driver=draft.top_negative_driver,
             quotes=draft.quotes,
-        ))
-    return insights
+        )
+
+    results = await asyncio.gather(*(_one(vid, s) for vid, s in underperforming))
+    return [insight for insight in results if insight is not None]
 
 
 async def build_channel_insights(
@@ -316,13 +327,18 @@ async def build_channel_insights(
     fallback_models: tuple[str, ...] = (STAGE_C_SYNTHESIS_FALLBACK,),
 ) -> ChannelInsights:
     """The full SPEC §3 report for one channel analysis."""
-    requests = await build_requests(
-        comments, stage_b, embeddings, api_key=api_key, model=model, fallback_models=fallback_models,
-    )
-    confusion_points = await build_confusion_points(
-        comments, stage_b, embeddings, api_key=api_key, model=model, fallback_models=fallback_models,
-    )
-    video_moods = await build_video_moods(
-        comments, sentiments, video_titles, api_key=api_key, model=model, fallback_models=fallback_models,
+    # The three blocks are fully independent of each other -- different
+    # candidate comments, different prompts, no shared mutable state --
+    # so run them concurrently instead of one after another.
+    requests, confusion_points, video_moods = await asyncio.gather(
+        build_requests(
+            comments, stage_b, embeddings, api_key=api_key, model=model, fallback_models=fallback_models,
+        ),
+        build_confusion_points(
+            comments, stage_b, embeddings, api_key=api_key, model=model, fallback_models=fallback_models,
+        ),
+        build_video_moods(
+            comments, sentiments, video_titles, api_key=api_key, model=model, fallback_models=fallback_models,
+        ),
     )
     return ChannelInsights(requests=requests, confusion_points=confusion_points, video_moods=video_moods)

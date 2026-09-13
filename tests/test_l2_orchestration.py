@@ -347,3 +347,62 @@ def test_analyze_channel_records_total_comment_count_for_the_spec_4_2_cache(monk
     assert progress.total_comment_count == 5  # 2 + 3 comments across the two videos
     assert found == job_id
     assert not_found is None
+
+
+def test_multiple_concurrent_batches_all_checkpoint_correctly(monkeypatch, pg_dsn):
+    """_run_checkpointed_pydantic_batches/_run_stage_a_embeddings now fire
+    every not-yet-done batch concurrently (asyncio.gather) rather than one
+    at a time, with Postgres writes serialized behind an asyncio.Lock
+    since they share one asyncpg connection. This forces enough comments
+    to actually produce multiple concurrent Stage A sentiment/embedding
+    batches (DEFAULT_SENTIMENT_BATCH_SIZE=50, DEFAULT_EMBEDDING_BATCH_SIZE=
+    100) against a real Postgres, to catch a lock/interleaving bug the
+    single-batch tests above can't -- e.g. a dropped or duplicated
+    checkpoint row, or a corrupted completed_units count.
+    """
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    calls: dict = {}
+    # 3 videos x 40 comments = 120 total -> 3 sentiment batches (50/50/20)
+    # and 2 embedding batches (100/20), all genuinely concurrent.
+    video_specs = [("v1", 40), ("v2", 40), ("v3", 40)]
+    _install_happy_path_mocks(monkeypatch, video_specs=video_specs, calls=calls)
+
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            from storage.postgres import create_job
+            job_id = await create_job(conn, "chan-concurrency-test")
+        finally:
+            await conn.close()
+
+        result = await orchestration.analyze_channel(
+            job_id, "chan-concurrency-test", youtube_api_key="yt-key", openrouter_api_key="or-key",
+        )
+
+        conn2 = await asyncpg.connect(pg_dsn)
+        try:
+            progress = await get_job_progress(conn2, job_id)
+            from storage.postgres import get_completed_batch_keys
+            sentiment_keys = await get_completed_batch_keys(conn2, job_id, orchestration.STAGE_SENTIMENT)
+            embedding_keys = await get_completed_batch_keys(conn2, job_id, orchestration.STAGE_EMBEDDING)
+        finally:
+            await conn2.close()
+        return result, progress, sentiment_keys, embedding_keys
+
+    result, progress, sentiment_keys, embedding_keys = _run(scenario())
+
+    assert len(result.comments) == 120
+    assert set(result.sentiments.keys()) == {c.id for c in result.comments}
+    assert set(result.embeddings.keys()) == {c.id for c in result.comments}
+    assert sentiment_keys == {"0", "50", "100"}  # 3 concurrent batches, none dropped/duplicated
+    assert embedding_keys == {"0", "100"}        # 2 concurrent batches
+    # completed_units accumulated correctly despite concurrent
+    # increment_completed_units calls sharing one connection under the lock
+    # (3 sentiment + 2 embedding + N stage_b + 1 stage_c batches by the
+    # time Stage C's own update_job_progress resets the counter for its
+    # stage -- checked directly against the call counts instead, which
+    # don't depend on which stage's counter is currently live).
+    assert len(calls["sentiment_batches"]) == 3
+    assert len(calls["embed_batches"]) == 2
+    assert progress.stage == orchestration.STAGE_INSIGHTS

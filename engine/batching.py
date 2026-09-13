@@ -17,6 +17,7 @@ Every stage's response schema must follow one shape:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import openai
@@ -172,13 +173,22 @@ async def classify_all_batches(
     error_cls: type[BatchClassificationFailedError] = BatchClassificationFailedError,
     fallback_models: tuple[str, ...] = (),
 ) -> dict[str, BaseModel]:
-    """Classify every comment in *comments*, chunked at *batch_size* per call."""
-    results: dict[str, BaseModel] = {}
-    for start in range(0, len(comments), batch_size):
-        batch = comments[start : start + batch_size]
-        results.update(await run_batched_llm_classification(
+    """Classify every comment in *comments*, chunked at *batch_size* per
+    call. Batches are independent of each other, so they run concurrently
+    (asyncio.gather) rather than one at a time -- this function has no
+    Postgres/checkpointing to serialize around (orchestration.py's own
+    checkpointed loop is the one that does, and handles its own
+    concurrency separately)."""
+    batches = [comments[start : start + batch_size] for start in range(0, len(comments), batch_size)]
+    per_batch_results = await asyncio.gather(*(
+        run_batched_llm_classification(
             batch, api_key=api_key, model=model, system_prompt=system_prompt,
             response_schema=response_schema, stage_label=stage_label, error_cls=error_cls,
             fallback_models=fallback_models,
-        ))
+        )
+        for batch in batches
+    ))
+    results: dict[str, BaseModel] = {}
+    for batch_result in per_batch_results:
+        results.update(batch_result)
     return results

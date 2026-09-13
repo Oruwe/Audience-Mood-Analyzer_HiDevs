@@ -33,6 +33,20 @@ or too failure-prone, the fix is a one-line swap back to a paid string
 here — same "bake-off is a two-line edit" property this file was already
 designed around.
 
+--- Stage A sentiment moved back to a paid model (2026-09-13, same day) ---
+That predicted failure mode showed up the same day, measured live: a real
+analysis spent 6+ minutes in Stage A alone, hitting the same
+"upstream_provider_shared_pool" 429 on effectively every batch. Stage A is
+the highest-volume stage (100% of comments, not a filtered subset), so
+it's also the one where free-tier throttling costs the most wall-clock
+time. The operator explicitly asked for lower latency and approved paying
+for Stage A specifically (Stage B/C stay free — much lower call volume,
+so the same throttling risk costs far less time there). STAGE_A_SENTIMENT
+below is a paid model again; STAGE_A_SENTIMENT_FALLBACK stays a free model
+-- cheap insurance against a genuine outage on the (now much more
+reliable, dedicated-capacity) paid primary, not the primary defense it was
+when the primary was itself free.
+
 --- Stage A architecture deviation from SPEC.md §4.1 (recorded 2026-09-13) ---
 SPEC §4.1 locks Stage A to a local, free, deterministic encoder, for four
 explicit reasons: cost (runs on 100% of comments), determinism (testable —
@@ -61,29 +75,30 @@ for exactly this reason — it's no longer just Stage B's problem.
 # ---------------------------------------------------------------------------
 
 STAGE_A_SENTIMENT_FALLBACK = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
-# Live incident (2026-09-13): STAGE_A_SENTIMENT alone failed a real analysis
-# and the live accuracy benchmark with a genuine, retry-surviving 429 --
-# "google/gemma-4-26b-a4b-it:free is temporarily rate-limited upstream ...
-# limit_source: upstream_provider_shared_pool" -- OpenRouter's free tier
-# shares each model's underlying provider capacity across every OpenRouter
-# user calling it for free, and Stage A is the highest-volume stage (100%
-# of comments, not a filtered subset), so it's the one most likely to hit
-# this. resilience.py's existing retry (4 attempts, backoff to 8s) is for
-# a momentary blip, not a sustained shared-pool exhaustion, and didn't
-# clear it. A different vendor (Nvidia, not Google) was picked as the
-# fallback specifically so a Google-side capacity event doesn't take out
-# both the primary and the fallback at once. engine/batching.py tries this
-# only after the primary has already exhausted its own retries.
+# Originally the safety net for a free STAGE_A_SENTIMENT primary; kept as
+# cheap ($0) insurance now that the primary is paid (see below) -- covers
+# a genuine OpenRouter/provider-wide outage on the primary, which
+# resilience.is_fallback_worthy_api_error still routes here immediately
+# (no wasted retry) on a RateLimitError or 404.
 
-STAGE_A_SENTIMENT = "openrouter/google/gemma-4-26b-a4b-it:free"
+STAGE_A_SENTIMENT = "openrouter/mistralai/mistral-nemo"
 # Runs on every comment (not a filtered subset like Stage B/C), so this is
 # the highest-volume call in the whole pipeline — a five-way sentiment
-# label, about the easiest task an LLM can be asked to do. Picked from
-# litellm's maintained cost map (github.com/BerriAI/litellm), filtered to
-# `openrouter/*` chat models tagged `:free` with `supports_response_schema:
-# true` (2026-09-13 pull) — a Mixture-of-Experts model with only ~4B active
-# params per token, the closest thing in the free set to matching this
-# stage's "cheapest/fastest that can still hit the schema" old criterion.
+# label, about the easiest task an LLM can be asked to do. Moved back to a
+# paid model (2026-09-13, same day as the free-tier switch) after a real
+# analysis measured 6+ minutes in this stage alone, hitting the same
+# "upstream_provider_shared_pool" 429 on effectively every batch -- see
+# this file's module docstring for the incident and the operator's
+# explicit choice to pay for lower latency here specifically. Picked from
+# litellm's maintained cost map filtered to `openrouter/*` chat models
+# declaring `supports_response_schema: true`: the single cheapest paid
+# entry once the `openrouter/auto` and `openrouter/free` meta-routers are
+# excluded (those route to a different pinned model per call, which would
+# silently reintroduce non-determinism a fixed string is supposed to
+# avoid) -- $0.019/$0.030 per M input/output tokens, cheaper even than the
+# very first paid pick this file ever made. Dedicated (not shared-pool)
+# capacity is the actual point of paying here, not the price itself,
+# which is still effectively noise for a five-way classification task.
 
 STAGE_A_EMBEDDINGS = "openrouter/liquid/lfm-2.5-embedding-350m:free"
 EMBEDDING_DIM = 1024

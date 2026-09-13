@@ -300,6 +300,19 @@ Graduate to Redis + RQ with a worker on Render when analyses exceed ~10 min or u
 concurrent. Temporal if you ever need genuinely durable long-running workflows. Both are week-8
 problems.
 
+**Concurrency, implemented (2026-09-13):** a real analysis measured 6+ minutes in Stage A alone,
+sequential batch-by-batch, on top of free-tier rate-limit/fallback overhead (see config/models.py's
+incident notes). `orchestration.py`'s per-stage batch loops now fire every not-yet-checkpointed
+batch concurrently (`asyncio.gather`) instead of one at a time; `engine/insights.py`'s Stage C
+clusters and its three insight blocks do the same. No explicit semaphore cap is applied — batch
+counts per stage are small and bounded by construction (SPEC §4.1's batch sizes, §4.1's own cluster
+caps), not attacker-controlled, so an unbounded `gather` over "however many batches this channel
+happens to produce" doesn't run away. Checkpoint writes (Postgres, one connection per job) are
+serialized behind an `asyncio.Lock` since asyncpg doesn't allow concurrent queries on one
+connection — the LLM calls themselves run fully concurrently, only the tiny write after each is
+serialized. Traded away: cancellation used to be checked between every single batch; it's now
+checked once before each stage's whole concurrent wave, a coarser (but still bounded) granularity.
+
 ## 9. State
 
 > **Postgres for anything you must not lose. Redis for anything shared across processes that you

@@ -23,6 +23,7 @@ from litellm.exceptions import (
     BadRequestError,
     NotFoundError,
     PermissionDeniedError,
+    RateLimitError,
     UnprocessableEntityError,
 )
 
@@ -66,9 +67,20 @@ DEFAULT_WAIT_MAX = 8.0          # seconds
 # against any model, so falling back doesn't help those -- but "this model
 # doesn't exist/isn't available" is specific to the one model string, and
 # is exactly what trying a different one fixes.
+#
+# RateLimitError joined this list for a latency reason, not a correctness
+# one (measured live, 2026-09-13): a free-tier 429's own error body says
+# "temporarily rate-limited upstream ... upstream_provider_shared_pool" --
+# a *sustained* shared-capacity exhaustion, confirmed by watching a real
+# job hit the same 429 on the same model dozens of times over several
+# minutes. Spending up to DEFAULT_MAX_ATTEMPTS retries with exponential
+# backoff (~20-30s worst case) against a condition that won't clear in
+# that window is pure wasted latency; falling back to a different model
+# immediately (still covered by NON_FALLBACK_API_ERRORS not listing it)
+# is strictly faster and no less correct.
 NON_RETRYABLE_API_ERRORS = (
     AuthenticationError, BadRequestError, NotFoundError,
-    PermissionDeniedError, UnprocessableEntityError,
+    PermissionDeniedError, RateLimitError, UnprocessableEntityError,
 )
 
 NON_FALLBACK_API_ERRORS = (

@@ -153,6 +153,18 @@ async def _run_checkpointed_pydantic_batches(
     *comments* at batch_size, skip chunks already checkpointed, run the
     rest via run_batch(chunk) -> {comment_id: item}, checkpoint each new
     chunk, and return the merged (already-done + new) dict.
+
+    Not-yet-checkpointed batches run concurrently (asyncio.gather) rather
+    than one at a time -- the actual run_batch(...) calls (network/LLM,
+    no shared state) are fully independent; only the Postgres writes that
+    follow each one share *conn* (one asyncpg connection per job, per this
+    module's docstring), which asyncpg doesn't allow concurrent queries
+    on, so those are serialized behind `_db_lock`. Cancellation is
+    therefore checked once, before firing this stage's whole batch of
+    calls, rather than between every individual batch as before -- a
+    coarser granularity (a cancel now takes effect between stages'
+    concurrent waves, not between every single batch within one), traded
+    for the latency win of not waiting on batches sequentially.
     """
     done = await get_completed_batch_keys(conn, job_id, stage)
     cached = await get_batch_results(conn, job_id, stage)
@@ -162,18 +174,25 @@ async def _run_checkpointed_pydantic_batches(
         for raw in payload["items"]
     }
 
-    for start in range(0, len(comments), batch_size):
-        batch_key = str(start)
-        await _check_cancel(conn, job_id)
-        if batch_key in done:
-            continue
-        batch = comments[start : start + batch_size]
+    await _check_cancel(conn, job_id)
+    db_lock = asyncio.Lock()
+
+    async def _run_one(batch_key: str, batch: list[RawComment]) -> dict[str, object]:
         batch_result = await run_batch(batch)
-        await record_batch_result(
-            conn, job_id, stage, batch_key,
-            result={"items": [item.model_dump(mode="json") for item in batch_result.values()]},
-        )
-        await increment_completed_units(conn, job_id, by=1)
+        async with db_lock:
+            await record_batch_result(
+                conn, job_id, stage, batch_key,
+                result={"items": [item.model_dump(mode="json") for item in batch_result.values()]},
+            )
+            await increment_completed_units(conn, job_id, by=1)
+        return batch_result
+
+    pending = [
+        (str(start), comments[start : start + batch_size])
+        for start in range(0, len(comments), batch_size)
+        if str(start) not in done
+    ]
+    for batch_result in await asyncio.gather(*(_run_one(key, batch) for key, batch in pending)):
         results.update(batch_result)
     return results
 
@@ -181,21 +200,30 @@ async def _run_checkpointed_pydantic_batches(
 async def _run_stage_a_embeddings(
     conn, job_id: str, comments: list[RawComment], *, client: httpx.AsyncClient, api_key: str,
 ) -> dict[str, list[float]]:
+    """Same concurrency/locking shape as `_run_checkpointed_pydantic_batches`
+    -- see its docstring."""
     done = await get_completed_batch_keys(conn, job_id, STAGE_EMBEDDING)
     cached = await get_batch_results(conn, job_id, STAGE_EMBEDDING)
     results: dict[str, list[float]] = {}
     for payload in cached.values():
         results.update(payload["vectors"])
 
-    for start in range(0, len(comments), DEFAULT_EMBEDDING_BATCH_SIZE):
-        batch_key = str(start)
-        await _check_cancel(conn, job_id)
-        if batch_key in done:
-            continue
-        batch = comments[start : start + DEFAULT_EMBEDDING_BATCH_SIZE]
+    await _check_cancel(conn, job_id)
+    db_lock = asyncio.Lock()
+
+    async def _run_one(batch_key: str, batch: list[RawComment]) -> dict[str, list[float]]:
         vectors = await embed_comments_batch(batch, client=client, api_key=api_key)
-        await record_batch_result(conn, job_id, STAGE_EMBEDDING, batch_key, result={"vectors": vectors})
-        await increment_completed_units(conn, job_id, by=1)
+        async with db_lock:
+            await record_batch_result(conn, job_id, STAGE_EMBEDDING, batch_key, result={"vectors": vectors})
+            await increment_completed_units(conn, job_id, by=1)
+        return vectors
+
+    pending = [
+        (str(start), comments[start : start + DEFAULT_EMBEDDING_BATCH_SIZE])
+        for start in range(0, len(comments), DEFAULT_EMBEDDING_BATCH_SIZE)
+        if str(start) not in done
+    ]
+    for vectors in await asyncio.gather(*(_run_one(key, batch) for key, batch in pending)):
         results.update(vectors)
     return results
 

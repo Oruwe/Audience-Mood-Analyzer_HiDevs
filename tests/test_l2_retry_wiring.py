@@ -243,11 +243,17 @@ def test_insights_stage_c_falls_back_immediately_on_a_not_found_error(monkeypatc
     assert result.choices[0].message.content == valid_json
 
 
-def test_batching_falls_back_to_a_different_model_once_the_primary_is_exhausted(monkeypatch):
+def test_batching_falls_back_immediately_on_a_rate_limit_without_retrying_it(monkeypatch):
     """Live incident (2026-09-13, config/models.py's *_FALLBACK constants):
-    a free OpenRouter model's 429 can be a sustained shared-pool
-    exhaustion that outlasts resilience.py's own retry window -- this is
-    the actual fix, not just the retry covered above."""
+    a free OpenRouter model's 429 is a *sustained* shared-pool exhaustion,
+    not a momentary blip -- confirmed by watching a real job hit the same
+    429 on the same model dozens of times over several minutes. Retrying
+    the SAME model (resilience.py's old behavior: up to 4 attempts,
+    backoff to 8s) before falling back was pure wasted latency once that
+    was known, so RateLimitError now skips straight to the fallback model
+    on the first attempt -- same as the NotFoundError case above, for a
+    latency reason rather than a "this model doesn't exist" one.
+    """
     comments = [_comment(0)]
     valid_json = json.dumps({
         "results": [{"comment_id": "c0", "sentiment": "positive", "confidence": 0.9}]
@@ -269,7 +275,7 @@ def test_batching_falls_back_to_a_different_model_once_the_primary_is_exhausted(
         fallback_models=("model-b",),
     ))
 
-    assert calls["model-a"] == 4  # exhausted every retry before giving up on it
+    assert calls["model-a"] == 1  # not retried -- a sustained 429 wouldn't clear in time anyway
     assert calls["model-b"] == 1
     assert result["c0"].sentiment.value == "positive"
 
@@ -290,7 +296,7 @@ def test_batching_raises_when_every_model_including_fallbacks_is_exhausted(monke
         ))
 
 
-def test_insights_stage_c_falls_back_to_a_different_model_once_the_primary_is_exhausted(monkeypatch):
+def test_insights_stage_c_falls_back_immediately_on_a_rate_limit_without_retrying_it(monkeypatch):
     valid_json = json.dumps({
         "theme": "Wants a Docker follow-up",
         "quotes": ["a real quote", "another real quote"],
@@ -313,7 +319,7 @@ def test_insights_stage_c_falls_back_to_a_different_model_once_the_primary_is_ex
         ("model-a", "model-b"), API_KEY, [{"role": "user", "content": "hi"}], RequestInsightDraft,
     ))
 
-    assert calls["model-a"] == 4
+    assert calls["model-a"] == 1  # not retried -- see the batching.py test's docstring
     assert calls["model-b"] == 1
     assert result.choices[0].message.content == valid_json
 

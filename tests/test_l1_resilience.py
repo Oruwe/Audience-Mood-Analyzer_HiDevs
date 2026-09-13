@@ -118,7 +118,7 @@ def _api_error(cls=APIError):
     return cls(**kwargs)
 
 
-@pytest.mark.parametrize("cls", [APIError, RateLimitError, ServiceUnavailableError])
+@pytest.mark.parametrize("cls", [APIError, ServiceUnavailableError])
 def test_is_retryable_api_error_true_for_transient_types(cls):
     assert is_retryable_api_error(_api_error(cls)) is True
 
@@ -126,6 +126,16 @@ def test_is_retryable_api_error_true_for_transient_types(cls):
 @pytest.mark.parametrize("cls", [AuthenticationError, BadRequestError, NotFoundError])
 def test_is_retryable_api_error_false_for_permanent_client_errors(cls):
     assert is_retryable_api_error(_api_error(cls)) is False
+
+
+def test_is_retryable_api_error_false_for_rate_limit_error():
+    """Latency fix, not correctness (measured live, 2026-09-13): a
+    free-tier 429 is a *sustained* shared-pool exhaustion, not a momentary
+    blip -- retrying the SAME model wastes ~20-30s before giving up on it
+    anyway. is_fallback_worthy_api_error (below) still treats it as
+    fallback-worthy, so the net effect is "skip straight to the fallback
+    model" instead of "retry, then fall back"."""
+    assert is_retryable_api_error(_api_error(RateLimitError)) is False
 
 
 def test_is_retryable_api_error_false_for_a_non_api_error():
