@@ -39,12 +39,21 @@ meaningless whenever it fired."
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 
-from config.models import STAGE_A_EMBEDDINGS, STAGE_A_SENTIMENT, STAGE_A_SENTIMENT_FALLBACK
+from config.models import (
+    STAGE_A_EMBEDDINGS,
+    STAGE_A_EMBEDDINGS_FALLBACK,
+    STAGE_A_SENTIMENT,
+    STAGE_A_SENTIMENT_FALLBACK,
+)
 from engine.batching import BatchClassificationFailedError, classify_all_batches
 from resilience import retry_transient
 from schemas import RawComment, StageASentimentBatch, StageASentimentItem
+
+logger = logging.getLogger(__name__)
 
 OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
 
@@ -127,6 +136,16 @@ class TransientEmbeddingError(EmbeddingAPIError):
 
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
+# 401/403 mean the API key itself is bad or lacks permission -- that fails
+# identically against any model, so falling back to a different one can't
+# help and shouldn't be tried. Every other non-2xx (404 "no endpoints", a
+# 5xx that outlasted _post_embeddings' own retries, ...) is specific to
+# *this* model/provider and is exactly what a fallback exists to route
+# around -- the live incident this fallback was added for was precisely a
+# 404, which isn't in _RETRYABLE_STATUS and so was previously a hard,
+# unfallback-able failure.
+_NON_FALLBACK_STATUS = frozenset({401, 403})
+
 
 def _openrouter_model_id(model: str) -> str:
     """config.models strings carry litellm's `openrouter/` routing prefix
@@ -154,6 +173,35 @@ async def _post_embeddings(
     if response.status_code != 200:
         raise EmbeddingAPIError(response.status_code, response.text)
     return response.json()
+
+
+async def _post_embeddings_with_fallback(
+    models: tuple[str, ...], client: httpx.AsyncClient, api_key: str, texts: list[str],
+) -> dict:
+    """Try *models* in order, same reasoning as
+    engine.batching._call_model_with_fallback: added after a live incident
+    (2026-09-13) where a 404 ("no endpoints found" for the configured
+    embedding model) was a hard, unfallback-able failure that would have
+    killed an entire analysis -- caught for $0.00015 by harness/preflight.py
+    instead, but embeddings had no recourse at all if it had reached
+    production. See _NON_FALLBACK_STATUS for which failures skip straight
+    to raising instead of trying the next model.
+    """
+    last_exc: EmbeddingAPIError | None = None
+    for i, model in enumerate(models):
+        try:
+            return await _post_embeddings(client, api_key, model, texts)
+        except EmbeddingAPIError as exc:
+            if exc.status_code in _NON_FALLBACK_STATUS:
+                raise
+            last_exc = exc
+            if i + 1 < len(models):
+                logger.warning(
+                    "Stage A embeddings: %s unavailable (%s); falling back to %s",
+                    model, exc, models[i + 1],
+                )
+    assert last_exc is not None  # unreachable with a non-empty models tuple
+    raise last_exc
 
 
 async def classify_sentiment_batch(
@@ -210,15 +258,22 @@ async def embed_comments_batch(
     client: httpx.AsyncClient,
     api_key: str,
     model: str = STAGE_A_EMBEDDINGS,
+    fallback_models: tuple[str, ...] = (STAGE_A_EMBEDDINGS_FALLBACK,),
 ) -> dict[str, list[float]]:
     """One embedding vector per comment, via OpenRouter's `/embeddings`
-    endpoint. Raises rather than silently degrading on any mismatch or
-    error — see the module docstring on why that's deliberate.
+    endpoint. Raises rather than silently degrading on a count mismatch —
+    see the module docstring on why that's deliberate; a fallback model
+    that returns the wrong shape is still a hard failure, not something
+    papered over. An HTTP-level failure (wrong/dead model, rate limit,
+    provider outage) instead tries *fallback_models* in order — see
+    `_post_embeddings_with_fallback`.
     """
     if not comments:
         return {}
 
-    data = await _post_embeddings(client, api_key, model, [c.text for c in comments])
+    data = await _post_embeddings_with_fallback(
+        (model, *fallback_models), client, api_key, [c.text for c in comments]
+    )
     items = data.get("data", [])
     if len(items) != len(comments):
         raise EmbeddingArrayLengthMismatchError(expected=len(comments), got=len(items))
@@ -239,12 +294,15 @@ async def embed_all_comments(
     api_key: str,
     model: str = STAGE_A_EMBEDDINGS,
     batch_size: int = DEFAULT_EMBEDDING_BATCH_SIZE,
+    fallback_models: tuple[str, ...] = (STAGE_A_EMBEDDINGS_FALLBACK,),
 ) -> dict[str, list[float]]:
     """Embed every comment, batched at *batch_size* per call."""
     vectors: dict[str, list[float]] = {}
     for start in range(0, len(comments), batch_size):
         batch = comments[start : start + batch_size]
         vectors.update(
-            await embed_comments_batch(batch, client=client, api_key=api_key, model=model)
+            await embed_comments_batch(
+                batch, client=client, api_key=api_key, model=model, fallback_models=fallback_models,
+            )
         )
     return vectors

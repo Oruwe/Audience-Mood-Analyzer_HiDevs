@@ -179,3 +179,89 @@ def test_a_model_id_without_the_prefix_is_left_untouched():
 
     asyncio.run(scenario())
     assert captured["model"] == "some-vendor/some-embedding-model"
+
+
+# ---------------------------------------------------------------------------
+# Fallback-on-failure. Live incident (2026-09-13): the configured embedding
+# model 404'd with OpenRouter's own "No endpoints found" -- and, before
+# this, embeddings had NO fallback mechanism at all, so that 404 would have
+# killed an entire real analysis outright (caught for $0.00015 by
+# harness/preflight.py instead). These prove the fix: a fallback-worthy
+# failure on the primary tries the next model; a request-level failure
+# (bad key) does not, because it would fail identically on any model.
+# ---------------------------------------------------------------------------
+
+def test_falls_back_to_a_different_model_on_a_404():
+    comments = [_comment(0)]
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        model = __import__("json").loads(request.content)["model"]
+        calls.append(model)
+        if model == "model-a":
+            return httpx.Response(404, json={"error": {"message": "No endpoints found for model-a"}})
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.1, 0.2]}]})
+
+    async def scenario():
+        async with _client(handler) as client:
+            return await stage_a.embed_comments_batch(
+                comments, client=client, api_key=API_KEY,
+                model="openrouter/model-a", fallback_models=("openrouter/model-b",),
+            )
+
+    result = asyncio.run(scenario())
+
+    assert calls == ["model-a", "model-b"]
+    assert result == {"c0": [0.1, 0.2]}
+
+
+def test_does_not_fall_back_on_a_401_bad_key():
+    """A bad API key fails identically against any model -- falling back
+    wastes a call and still fails, so it must not be tried."""
+    comments = [_comment(0)]
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(__import__("json").loads(request.content)["model"])
+        return httpx.Response(401, text="invalid api key")
+
+    async def scenario():
+        async with _client(handler) as client:
+            return await stage_a.embed_comments_batch(
+                comments, client=client, api_key=API_KEY,
+                model="openrouter/model-a", fallback_models=("openrouter/model-b",),
+            )
+
+    with pytest.raises(stage_a.EmbeddingAPIError) as exc_info:
+        asyncio.run(scenario())
+
+    assert exc_info.value.status_code == 401
+    assert calls == ["model-a"]  # never tried model-b
+
+
+def test_raises_the_last_error_when_every_model_including_fallbacks_fails():
+    comments = [_comment(0)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": {"message": "no endpoints"}})
+
+    async def scenario():
+        async with _client(handler) as client:
+            return await stage_a.embed_comments_batch(
+                comments, client=client, api_key=API_KEY,
+                model="openrouter/model-a", fallback_models=("openrouter/model-b",),
+            )
+
+    with pytest.raises(stage_a.EmbeddingAPIError) as exc_info:
+        asyncio.run(scenario())
+    assert exc_info.value.status_code == 404
+
+
+def test_default_fallback_is_the_configured_stage_a_embeddings_fallback():
+    """No caller in production passes fallback_models explicitly (same
+    pattern as the other three stages) -- the default must be the real
+    configured constant, not an empty tuple that silently disables the
+    protection this was built for."""
+    import inspect
+    default = inspect.signature(stage_a.embed_comments_batch).parameters["fallback_models"].default
+    assert default == (stage_a.STAGE_A_EMBEDDINGS_FALLBACK,)

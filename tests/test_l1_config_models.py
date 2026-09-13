@@ -21,6 +21,7 @@ _MODEL_STRINGS = [
     models.STAGE_A_SENTIMENT,
     models.STAGE_A_SENTIMENT_FALLBACK,
     models.STAGE_A_EMBEDDINGS,
+    models.STAGE_A_EMBEDDINGS_FALLBACK,
     models.STAGE_B_CLASSIFY,
     models.STAGE_B_CLASSIFY_FALLBACK,
     models.STAGE_C_SYNTHESIS,
@@ -65,6 +66,7 @@ def test_embedding_dim_matches_stage_a_embedder():
         "openrouter/qwen/qwen3-embedding-8b": 4096,
         "openrouter/openai/text-embedding-3-small": 1536,
         "openrouter/openai/text-embedding-3-large": 3072,
+        "openrouter/openai/text-embedding-ada-002": 1536,
     }
     expected = known_dims.get(models.STAGE_A_EMBEDDINGS)
     if expected is not None:

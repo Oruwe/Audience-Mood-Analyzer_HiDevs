@@ -135,20 +135,39 @@ STAGE_A_SENTIMENT = "openrouter/mistralai/mistral-nemo"
 # capacity is the actual point of paying here, not the price itself,
 # which is still effectively noise for a five-way classification task.
 
-STAGE_A_EMBEDDINGS = "openrouter/qwen/qwen3-embedding-0.6b"
-EMBEDDING_DIM = 1024
-# Back to the paid pick this stage originally shipped with (~$0.01/M
-# tokens), reverting the free swap for the same measured-latency reason as
-# STAGE_A_SENTIMENT above. Two things make this the low-risk revert rather
-# than a fresh guess: its 1,024-dimension output already matches
-# EMBEDDING_DIM (no re-derivation, no re-embed of anything), and the bug
-# that made it look broken the first time was never the model -- it was
-# engine/stage_a.py sending litellm's `openrouter/` routing prefix to
-# OpenRouter's own REST endpoint, fixed there by `_openrouter_model_id`
-# and covered by tests. Note litellm's cost map still has zero
-# openrouter/* embedding-mode entries at any price, so unlike the three
-# chat stages this price is from openrouter.ai's model page, not the
-# registry -- it is not automatically tracked if OpenRouter changes it.
+STAGE_A_EMBEDDINGS_FALLBACK = "openrouter/openai/text-embedding-ada-002"
+# Deliberately the SAME vendor as the primary below, breaking this file's
+# usual different-vendor-fallback rule -- and that break is required, not
+# careless: unlike a chat completion (fixed JSON schema regardless of
+# which model answers), an embedding's output width is a property of the
+# model itself. A fallback at a different width would corrupt
+# engine/insights.py's clustering (KMeans over vectors of inconsistent
+# size) rather than merely running on a different model. ada-002 and
+# text-embedding-3-small share the 1536 dimension below by construction,
+# which is the actual selection constraint here.
+
+STAGE_A_EMBEDDINGS = "openrouter/openai/text-embedding-3-small"
+EMBEDDING_DIM = 1536
+# Live incident (2026-09-13): the previous pick, qwen/qwen3-embedding-0.6b,
+# 404'd with OpenRouter's own "No endpoints found for
+# qwen/qwen3-embedding-0.6b" -- caught by harness/preflight.py before a
+# real analysis hit it, for $0.00015. That was the SECOND embedding model
+# this file has picked that turned out unreliable on OpenRouter (the free
+# liquid/lfm-2.5-embedding-350m before it was never verified live either).
+# Both were smaller/niche-vendor picks; OpenAI's embeddings are as close
+# to commodity infrastructure as this ecosystem has; every serious LLM
+# aggregator serves them, and OpenAI has no incentive to deprecate one of
+# its most-used endpoints. Preferring that reliability over vendor
+# novelty is the point of this specific swap. Cost ~$0.02/M tokens.
+# engine/stage_a.py now also gives this stage the same fallback-on-failure
+# protection the other three stages have had all along (previously
+# embeddings had none at all -- a single 404 killed the whole pipeline
+# with no recourse, exactly what just happened).
+#
+# litellm's cost map still has zero openrouter/* embedding-mode entries at
+# any price, for either model above -- this pick and its dimension are
+# NOT registry-verified, only harness/preflight.py verifies them, against
+# the real live endpoint, before they're trusted with real spend.
 
 # ---------------------------------------------------------------------------
 # Stage B / C — OpenRouter, generative (SPEC §4.1, §7, §11)

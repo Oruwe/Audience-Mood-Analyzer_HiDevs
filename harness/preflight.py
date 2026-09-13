@@ -190,6 +190,7 @@ async def check_model_config() -> tuple[str, str]:
         "STAGE_C_SYNTHESIS": models.STAGE_C_SYNTHESIS,
         "STAGE_C_SYNTHESIS_FALLBACK": models.STAGE_C_SYNTHESIS_FALLBACK,
         "STAGE_A_EMBEDDINGS": models.STAGE_A_EMBEDDINGS,
+        "STAGE_A_EMBEDDINGS_FALLBACK": models.STAGE_A_EMBEDDINGS_FALLBACK,
     }
     problems = [
         f"{name} is not an openrouter/* string ({value!r})"
@@ -201,10 +202,13 @@ async def check_model_config() -> tuple[str, str]:
 
     # A stage sharing its primary with its own fallback isn't an error, but
     # it does mean that stage has no real insurance -- one provider outage
-    # takes out both. Worth saying out loud.
+    # takes out both. Worth saying out loud. Embeddings is excluded on
+    # purpose: config/models.py documents why its fallback must match
+    # dimension, which made same-vendor the deliberate, correct choice
+    # there rather than an oversight.
     same_vendor = [
         stage for stage, (primary, fb) in {
-            "Stage A": (models.STAGE_A_SENTIMENT, models.STAGE_A_SENTIMENT_FALLBACK),
+            "Stage A · sentiment": (models.STAGE_A_SENTIMENT, models.STAGE_A_SENTIMENT_FALLBACK),
             "Stage B": (models.STAGE_B_CLASSIFY, models.STAGE_B_CLASSIFY_FALLBACK),
             "Stage C": (models.STAGE_C_SYNTHESIS, models.STAGE_C_SYNTHESIS_FALLBACK),
         }.items()
@@ -215,7 +219,7 @@ async def check_model_config() -> tuple[str, str]:
         return FAIL, "; ".join(problems)
     if same_vendor:
         return WARN, f"{', '.join(same_vendor)} share a vendor with their fallback"
-    return PASS, f"7 model strings well-formed, EMBEDDING_DIM={models.EMBEDDING_DIM}"
+    return PASS, f"8 model strings well-formed, EMBEDDING_DIM={models.EMBEDDING_DIM}"
 
 
 async def check_postgres() -> tuple[str, str]:
@@ -390,7 +394,8 @@ async def run_preflight(*, offline: bool = False) -> PreflightReport:
         for name in (
             "OpenRouter key + credit", "YouTube API key",
             "Stage A · sentiment", "Stage A · sentiment fallback",
-            "Stage A · embeddings", "Stage B · classify", "Stage B · classify fallback",
+            "Stage A · embeddings", "Stage A · embeddings fallback",
+            "Stage B · classify", "Stage B · classify fallback",
             "Stage C · synthesis", "Stage C · synthesis fallback",
         ):
             report.results.append(CheckResult(name, SKIP, "--offline"))
@@ -411,7 +416,8 @@ async def run_preflight(*, offline: bool = False) -> PreflightReport:
             for name in (
                 "OpenRouter key + credit",
                 "Stage A · sentiment", "Stage A · sentiment fallback",
-                "Stage A · embeddings", "Stage B · classify", "Stage B · classify fallback",
+                "Stage A · embeddings", "Stage A · embeddings fallback",
+                "Stage B · classify", "Stage B · classify fallback",
                 "Stage C · synthesis", "Stage C · synthesis fallback",
             ):
                 report.results.append(CheckResult(name, SKIP, "OPENROUTER_API_KEY not set"))
@@ -428,6 +434,9 @@ async def run_preflight(*, offline: bool = False) -> PreflightReport:
         report.results.append(await _timed(
             "Stage A · embeddings",
             check_embeddings(models.STAGE_A_EMBEDDINGS, openrouter_key, client)))
+        report.results.append(await _timed(
+            "Stage A · embeddings fallback",
+            check_embeddings(models.STAGE_A_EMBEDDINGS_FALLBACK, openrouter_key, client)))
         report.results.append(await _timed(
             "Stage B · classify", check_stage_b_classify(models.STAGE_B_CLASSIFY, openrouter_key)))
         report.results.append(await _timed(
