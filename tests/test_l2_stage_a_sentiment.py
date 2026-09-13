@@ -2,7 +2,9 @@
 
 Stubs litellm.acompletion (no network, no OpenRouter key) to exercise the
 SPEC §4.1b batching guard: exact array length AND comment-id set must match
-the input, or the batch is split in half and retried.
+the input, or the batch is split in half and retried. The guard itself
+lives in engine.batching (shared with Stage B) — that's where acompletion
+is actually called from, so that's what gets patched here.
 """
 
 import asyncio
@@ -11,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import engine.batching as batching
 import engine.stage_a as stage_a
 from schemas import RawComment
 
@@ -44,7 +47,7 @@ def test_empty_batch_short_circuits_without_calling_the_model(monkeypatch):
     async def fail_if_called(*args, **kwargs):
         raise AssertionError("should not call acompletion for an empty batch")
 
-    monkeypatch.setattr(stage_a, "acompletion", fail_if_called)
+    monkeypatch.setattr(batching, "acompletion", fail_if_called)
     result = asyncio.run(stage_a.classify_sentiment_batch([], api_key=API_KEY))
     assert result == {}
 
@@ -57,7 +60,7 @@ def test_happy_path_returns_one_result_per_comment(monkeypatch):
         calls["count"] += 1
         return _fake_response(_valid_batch_json(comments))
 
-    monkeypatch.setattr(stage_a, "acompletion", fake_acompletion)
+    monkeypatch.setattr(batching, "acompletion", fake_acompletion)
     result = asyncio.run(stage_a.classify_sentiment_batch(comments, api_key=API_KEY))
 
     assert calls["count"] == 1
@@ -85,7 +88,7 @@ def test_length_mismatch_splits_batch_and_retries(monkeypatch):
         matching = [c for c in comments if c.id in requested_ids]
         return _fake_response(_valid_batch_json(matching))
 
-    monkeypatch.setattr(stage_a, "acompletion", fake_acompletion)
+    monkeypatch.setattr(batching, "acompletion", fake_acompletion)
     result = asyncio.run(stage_a.classify_sentiment_batch(comments, api_key=API_KEY))
 
     assert set(result.keys()) == {c.id for c in comments}
@@ -109,7 +112,7 @@ def test_id_set_mismatch_counts_as_invalid_even_with_correct_length(monkeypatch)
             ]
         }))
 
-    monkeypatch.setattr(stage_a, "acompletion", fake_acompletion)
+    monkeypatch.setattr(batching, "acompletion", fake_acompletion)
     with pytest.raises(stage_a.SentimentBatchFailedError):
         asyncio.run(stage_a.classify_sentiment_batch(comments, api_key=API_KEY))
 
@@ -120,7 +123,7 @@ def test_malformed_json_is_treated_as_a_mismatch_not_a_crash(monkeypatch):
     async def fake_acompletion(**kwargs):
         return _fake_response("not json at all")
 
-    monkeypatch.setattr(stage_a, "acompletion", fake_acompletion)
+    monkeypatch.setattr(batching, "acompletion", fake_acompletion)
     with pytest.raises(stage_a.SentimentBatchFailedError):
         asyncio.run(stage_a.classify_sentiment_batch(comments, api_key=API_KEY))
 
@@ -143,7 +146,7 @@ def test_injection_cannot_produce_an_out_of_enum_sentiment(monkeypatch):
             "results": [{"comment_id": "c0", "sentiment": "DEFINITELY_HACKED", "confidence": 0.99}]
         }))
 
-    monkeypatch.setattr(stage_a, "acompletion", fake_acompletion)
+    monkeypatch.setattr(batching, "acompletion", fake_acompletion)
     with pytest.raises(stage_a.SentimentBatchFailedError):
         asyncio.run(stage_a.classify_sentiment_batch(comments, api_key=API_KEY))
 
@@ -159,7 +162,7 @@ def test_classify_all_sentiments_batches_at_the_configured_size(monkeypatch):
         batch = [c for c in comments if c.id in content]
         return _fake_response(_valid_batch_json(batch))
 
-    monkeypatch.setattr(stage_a, "acompletion", fake_acompletion)
+    monkeypatch.setattr(batching, "acompletion", fake_acompletion)
     result = asyncio.run(
         stage_a.classify_all_sentiments(comments, api_key=API_KEY, batch_size=4)
     )

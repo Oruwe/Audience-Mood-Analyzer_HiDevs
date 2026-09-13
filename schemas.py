@@ -1,6 +1,6 @@
 """Pydantic schemas shared across ingestion, analysis, and storage layers."""
 
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 
 from pydantic import BaseModel, Field
@@ -12,24 +12,6 @@ class Sentiment(str, Enum):
     NEUTRAL = "neutral"
     NEGATIVE = "negative"
     CRITICAL_ESCALATION = "critical_escalation"
-
-
-class PrimaryIntent(str, Enum):
-    BUG_REPORT = "bug_report"
-    FEATURE_REQUEST = "feature_request"
-    PRICING_COMPLAINT = "pricing_complaint"
-    PRAISE_ENDORSEMENT = "praise_endorsement"
-    CHURN_RISK = "churn_risk"
-    GENERAL_INQUIRY = "general_inquiry"
-    SARCASTIC_TROLL = "sarcastic_troll"
-
-
-class RecommendedAction(str, Enum):
-    IGNORE = "ignore"
-    COMMUNITY_REPLY = "community_reply"
-    ESCALATE_TO_SUPPORT = "escalate_to_support"
-    ESCALATE_TO_PR = "escalate_to_pr"
-    AMPLIFY_MARKETING = "amplify_marketing"
 
 
 class RawComment(BaseModel):
@@ -47,34 +29,6 @@ class RawComment(BaseModel):
     is_reply: bool = False            # top-level comment vs. a reply under it
 
 
-class DeepMoodAnalysis(BaseModel):
-    """LLM-facing contract: only the fields the model must generate."""
-    sentiment: Sentiment
-    confidence: float = Field(ge=0.0, le=1.0)
-    primary_intent: PrimaryIntent
-    urgency_score: float = Field(ge=0.0, le=1.0)
-    emotional_drivers: list[str] = Field(default_factory=list)
-    summary: str
-    recommended_action: RecommendedAction
-    suggested_reply_draft: str | None = None
-    brand_safety_flag: bool = False
-
-
-class EnrichedCommentRecord(DeepMoodAnalysis):
-    """Full analysis record. (Persistence target is being rebuilt per
-    SPEC §4.3 — Postgres/Neon, not the DuckDB this record's shape predates.)
-    """
-    comment_id: str
-    platform: str | None = None
-    author_handle: str | None = None
-    raw_text: str | None = None
-    embedding: list[float] | None = None
-    cluster_id: int | None = None
-    latency_ms: float | None = None
-    model_used: str | None = None
-    processed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-
 # ---------------------------------------------------------------------------
 # Stage A (SPEC §4.1, amended 2026-09-13 — see config/models.py). LLM-facing
 # batch contract for sentiment classification over 100% of comments, with
@@ -90,3 +44,31 @@ class StageASentimentItem(BaseModel):
 class StageASentimentBatch(BaseModel):
     """One LLM response for one batch of comments."""
     results: list[StageASentimentItem]
+
+
+# ---------------------------------------------------------------------------
+# Stage B (SPEC §4.1) — LLM-facing batch contract for the Stage-A-flagged
+# subset (~10-20% of comments). Authored fresh for this product: V2's
+# PrimaryIntent (bug_report/pricing_complaint/churn_risk/...) was for
+# brand-monitoring support triage, which this product isn't. CommentIntent
+# below exists to serve SPEC §3's three insight blocks directly.
+# ---------------------------------------------------------------------------
+
+class CommentIntent(str, Enum):
+    REQUEST = "request"        # asking for future content, e.g. "make a Docker follow-up"
+    CONFUSION = "confusion"    # lost/confused about something in the video
+    PRAISE = "praise"          # positive reaction, no ask
+    CRITICISM = "criticism"    # negative reaction, no ask
+    OTHER = "other"            # spam, off-topic, unrelated to the video
+
+
+class StageBClassificationItem(BaseModel):
+    comment_id: str
+    intent: CommentIntent
+    is_request: bool
+    is_confusion: bool
+
+
+class StageBClassificationBatch(BaseModel):
+    """One LLM response for one batch of comments."""
+    results: list[StageBClassificationItem]

@@ -26,26 +26,24 @@ Both batch functions apply the SPEC §4.1b guard — originally written with
 Stage B in mind, but it applies just as much here now that Stage A is also
 a batched generative call: the response must return exactly one result per
 input comment, matched by `comment_id`, never by list position. Sentiment
-batches retry via split-in-half on any mismatch, per §4.1b's exact wording
-("On mismatch, split the batch in half and retry"). The embeddings
-endpoint isn't LLM-generated free-form JSON, so a count mismatch there is a
-hard error instead — and it is a hard error, deliberately: SPEC §4.1 calls
-out V2's old hash-vector fallback by name as the mistake not to repeat,
-because it "silently made clustering meaningless whenever it fired."
+batching delegates the actual split-and-retry mechanics to
+engine.batching (shared with Stage B, engine/llm_client.py, since both are
+the same "batched map, N-in-N-out" shape) per §4.1b's exact wording ("On
+mismatch, split the batch in half and retry"). The embeddings endpoint
+isn't LLM-generated free-form JSON and isn't this same shape, so a count
+mismatch there is a hard error handled locally instead — and it is a hard
+error, deliberately: SPEC §4.1 calls out V2's old hash-vector fallback by
+name as the mistake not to repeat, because it "silently made clustering
+meaningless whenever it fired."
 """
 
 from __future__ import annotations
 
-import logging
-
 import httpx
-from litellm import acompletion
-from pydantic import ValidationError
 
 from config.models import STAGE_A_EMBEDDINGS, STAGE_A_SENTIMENT
+from engine.batching import BatchClassificationFailedError, classify_all_batches
 from schemas import RawComment, StageASentimentBatch, StageASentimentItem
-
-logger = logging.getLogger(__name__)
 
 OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
 
@@ -67,7 +65,7 @@ class StageAError(RuntimeError):
     """Base class for Stage A errors raised on purpose."""
 
 
-class SentimentBatchFailedError(StageAError):
+class SentimentBatchFailedError(StageAError, BatchClassificationFailedError):
     """A single-comment batch still failed after splitting as far as it can."""
 
 
@@ -89,64 +87,28 @@ class EmbeddingAPIError(StageAError):
         super().__init__(f"OpenRouter embeddings -> HTTP {status_code}: {body[:500]}")
 
 
-def _build_sentiment_messages(comments: list[RawComment]) -> list[dict]:
-    lines = "\n".join(f"{c.id}: {c.text}" for c in comments)
-    return [
-        {"role": "system", "content": SENTIMENT_SYSTEM_PROMPT},
-        {"role": "user", "content": lines},
-    ]
-
-
-def _parse_sentiment_response(raw_content: str) -> StageASentimentBatch | None:
-    try:
-        return StageASentimentBatch.model_validate_json(raw_content)
-    except (ValidationError, ValueError):
-        return None
-
-
 async def classify_sentiment_batch(
     comments: list[RawComment],
     *,
     api_key: str,
     model: str = STAGE_A_SENTIMENT,
 ) -> dict[str, StageASentimentItem]:
-    """Classify one batch, applying the SPEC §4.1b split-and-retry guard.
+    """Classify one batch, applying the SPEC §4.1b split-and-retry guard
+    (engine.batching — shared with Stage B).
 
     Returns a dict keyed by comment_id, covering exactly the input comments
-    — guaranteed by the guard below, never a partial or misaligned result.
+    — guaranteed by the guard, never a partial or misaligned result.
     """
-    if not comments:
-        return {}
-
-    response = await acompletion(
-        model=model,
+    return await classify_all_batches(
+        comments,
         api_key=api_key,
-        messages=_build_sentiment_messages(comments),
-        response_format=StageASentimentBatch,
-        timeout=30,
+        model=model,
+        system_prompt=SENTIMENT_SYSTEM_PROMPT,
+        response_schema=StageASentimentBatch,
+        stage_label="Stage A sentiment",
+        batch_size=len(comments) or 1,  # one call for this whole batch, no chunking
+        error_cls=SentimentBatchFailedError,
     )
-    parsed = _parse_sentiment_response(response.choices[0].message.content)
-
-    expected_ids = {c.id for c in comments}
-    if parsed is not None and len(parsed.results) == len(comments):
-        got_ids = {item.comment_id for item in parsed.results}
-        if got_ids == expected_ids:
-            return {item.comment_id: item for item in parsed.results}
-
-    # SPEC §4.1b: "On mismatch, split the batch in half and retry."
-    if len(comments) == 1:
-        raise SentimentBatchFailedError(
-            f"Sentiment classification failed for comment {comments[0].id!r} "
-            "even as a single-item batch."
-        )
-    logger.warning(
-        "Sentiment batch of %d returned a length/id mismatch; splitting and retrying",
-        len(comments),
-    )
-    mid = len(comments) // 2
-    left = await classify_sentiment_batch(comments[:mid], api_key=api_key, model=model)
-    right = await classify_sentiment_batch(comments[mid:], api_key=api_key, model=model)
-    return {**left, **right}
 
 
 async def classify_all_sentiments(
@@ -156,12 +118,17 @@ async def classify_all_sentiments(
     model: str = STAGE_A_SENTIMENT,
     batch_size: int = DEFAULT_SENTIMENT_BATCH_SIZE,
 ) -> dict[str, StageASentimentItem]:
-    """Classify every comment, batched at *batch_size* per call."""
-    results: dict[str, StageASentimentItem] = {}
-    for start in range(0, len(comments), batch_size):
-        batch = comments[start : start + batch_size]
-        results.update(await classify_sentiment_batch(batch, api_key=api_key, model=model))
-    return results
+    """Classify every comment, chunked at *batch_size* per call."""
+    return await classify_all_batches(
+        comments,
+        api_key=api_key,
+        model=model,
+        system_prompt=SENTIMENT_SYSTEM_PROMPT,
+        response_schema=StageASentimentBatch,
+        stage_label="Stage A sentiment",
+        batch_size=batch_size,
+        error_cls=SentimentBatchFailedError,
+    )
 
 
 async def embed_comments_batch(
