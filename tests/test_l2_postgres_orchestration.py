@@ -28,9 +28,11 @@ from storage.postgres import (
     increment_completed_units,
     init_schema,
     is_cancel_requested,
+    reap_stale_jobs,
     record_batch_result,
     request_cancellation,
     save_eval_run,
+    touch_heartbeat,
     update_job_progress,
 )
 
@@ -299,3 +301,113 @@ def test_get_latest_eval_run_none_when_table_is_empty(pg_dsn):
             await conn.close()
 
     assert _run(scenario()) is None
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat + stale-job reaping.
+#
+# Live incident (2026-09-13): a job's background thread died with its
+# container mid-analysis. Nothing restarted it and nothing marked it dead,
+# so its row sat at status='running' indefinitely and the UI polled a
+# corpse -- spinner forever, Cancel button with nothing left to cancel.
+# These cover the two halves of the fix: a worker proving it's alive, and
+# a reaper retiring the ones that stopped proving it.
+# ---------------------------------------------------------------------------
+
+def test_touch_heartbeat_sets_and_advances_heartbeat_at(pg_dsn):
+    async def scenario():
+        conn, job_id = await _fresh_job(pg_dsn)
+        try:
+            before = await get_job_progress(conn, job_id)
+            await touch_heartbeat(conn, job_id)
+            first = await get_job_progress(conn, job_id)
+            await touch_heartbeat(conn, job_id)
+            second = await get_job_progress(conn, job_id)
+            return before.heartbeat_at, first.heartbeat_at, second.heartbeat_at
+        finally:
+            await conn.close()
+
+    before, first, second = _run(scenario())
+    assert before is None          # never touched yet
+    assert first is not None
+    assert second >= first         # advances on each touch
+
+
+def test_reap_stale_jobs_fails_a_running_job_whose_worker_went_silent(pg_dsn):
+    async def scenario():
+        conn, job_id = await _fresh_job(pg_dsn, "chan-reap-stale")
+        try:
+            await claim_job(conn, job_id)
+            # Backdate the heartbeat well past the staleness window.
+            await conn.execute(
+                "UPDATE analysis_jobs SET heartbeat_at = now() - interval '20 minutes' "
+                "WHERE id = $1",
+                job_id,
+            )
+            reaped = await reap_stale_jobs(conn, stale_after_seconds=300)
+            return reaped, await get_job_progress(conn, job_id)
+        finally:
+            await conn.close()
+
+    reaped, progress = _run(scenario())
+    assert reaped >= 1
+    assert progress.status == "failed"
+    assert "restarted" in (progress.error or "") or "slept" in (progress.error or "")
+    assert progress.finished_at is not None
+
+
+def test_reap_stale_jobs_leaves_a_live_job_alone(pg_dsn):
+    async def scenario():
+        conn, job_id = await _fresh_job(pg_dsn, "chan-reap-live")
+        try:
+            await claim_job(conn, job_id)
+            await touch_heartbeat(conn, job_id)  # beating right now
+            await reap_stale_jobs(conn, stale_after_seconds=300)
+            return await get_job_progress(conn, job_id)
+        finally:
+            await conn.close()
+
+    assert _run(scenario()).status == "running"
+
+
+def test_reap_stale_jobs_ignores_jobs_that_are_not_running(pg_dsn):
+    """A completed job is never 'stale' no matter how old -- reaping one
+    would rewrite finished history and lose a cached analysis."""
+    async def scenario():
+        conn, job_id = await _fresh_job(pg_dsn, "chan-reap-completed")
+        try:
+            await claim_job(conn, job_id)
+            await finish_job(conn, job_id, status="completed")
+            await conn.execute(
+                "UPDATE analysis_jobs SET heartbeat_at = now() - interval '20 minutes' "
+                "WHERE id = $1",
+                job_id,
+            )
+            await reap_stale_jobs(conn, stale_after_seconds=300)
+            return await get_job_progress(conn, job_id)
+        finally:
+            await conn.close()
+
+    progress = _run(scenario())
+    assert progress.status == "completed"
+    assert progress.error is None
+
+
+def test_reap_stale_jobs_catches_pre_heartbeat_zombies_via_claimed_at(pg_dsn):
+    """Jobs claimed before heartbeat_at existed have it NULL forever; they
+    must still be reapable or the upgrade leaves permanent zombies."""
+    async def scenario():
+        conn, job_id = await _fresh_job(pg_dsn, "chan-reap-legacy")
+        try:
+            await claim_job(conn, job_id)
+            await conn.execute(
+                "UPDATE analysis_jobs SET heartbeat_at = NULL, "
+                "claimed_at = now() - interval '20 minutes' WHERE id = $1",
+                job_id,
+            )
+            await reap_stale_jobs(conn, stale_after_seconds=300)
+            return await get_job_progress(conn, job_id)
+        finally:
+            await conn.close()
+
+    assert _run(scenario()).status == "failed"

@@ -406,3 +406,152 @@ def test_multiple_concurrent_batches_all_checkpoint_correctly(monkeypatch, pg_ds
     assert len(calls["sentiment_batches"]) == 3
     assert len(calls["embed_batches"]) == 2
     assert progress.stage == orchestration.STAGE_INSIGHTS
+
+
+# ---------------------------------------------------------------------------
+# Concurrency cap, resume-progress accounting, and the job deadline.
+#
+# All three are fixes for defects found auditing before the first paid run:
+# unbounded gather (SPEC §8 named a Semaphore; it had been reasoned away on
+# the false premise that batch counts are small), a progress bar that could
+# never reach 100% on a resumed job, and a wedged job that could hold
+# 'running' forever because cancellation is cooperative and a hung await
+# never reaches the next check.
+# ---------------------------------------------------------------------------
+
+def test_bounded_gather_never_exceeds_the_concurrency_cap():
+    peak = {"now": 0, "max": 0}
+
+    async def work():
+        peak["now"] += 1
+        peak["max"] = max(peak["max"], peak["now"])
+        await asyncio.sleep(0.01)
+        peak["now"] -= 1
+        return 1
+
+    results = _run(orchestration._bounded_gather([work() for _ in range(50)], limit=4))
+
+    assert sum(results) == 50      # every unit of work still ran
+    assert peak["max"] <= 4        # but never more than 4 at once
+
+
+def test_bounded_gather_preserves_result_order():
+    async def work(i):
+        # Later items finish first, so ordering can only be right if
+        # gather's ordering guarantee is preserved through the semaphore.
+        await asyncio.sleep(0.01 * (5 - i))
+        return i
+
+    assert _run(orchestration._bounded_gather([work(i) for i in range(5)], limit=2)) == [0, 1, 2, 3, 4]
+
+
+def test_resumed_job_progress_counts_work_already_checkpointed(monkeypatch, pg_dsn):
+    """A resumed job skips checkpointed batches, so if the counter started
+    at 0 it could never reach total -- the bar would sit at 2/5 forever on
+    a job that was actually finished."""
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    calls: dict = {}
+    video_specs = [("v1", 40), ("v2", 40), ("v3", 40)]  # 120 comments -> 3 sentiment batches
+    _install_happy_path_mocks(monkeypatch, video_specs=video_specs, calls=calls)
+
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            from storage.postgres import create_job
+            job_id = await create_job(conn, "chan-resume-progress")
+        finally:
+            await conn.close()
+
+        # First run completes everything and checkpoints it.
+        await orchestration.analyze_channel(
+            job_id, "chan-resume-progress", youtube_api_key="yt", openrouter_api_key="or",
+        )
+        first_pass_batches = len(calls["sentiment_batches"])
+
+        # Second run over the same job: every batch is a checkpoint hit, so
+        # nothing increments -- progress must still report fully complete.
+        await orchestration.analyze_channel(
+            job_id, "chan-resume-progress", youtube_api_key="yt", openrouter_api_key="or",
+        )
+
+        conn2 = await asyncpg.connect(pg_dsn)
+        try:
+            return first_pass_batches, len(calls["sentiment_batches"]), await get_job_progress(conn2, job_id)
+        finally:
+            await conn2.close()
+
+    first_pass, second_pass, progress = _run(scenario())
+
+    assert first_pass == 3
+    assert second_pass == 3               # no re-work on resume
+    assert progress.total_units == 1      # last stage (stage_c) is a single unit
+    assert progress.completed_units == 1  # and it is counted as done, not 0
+    assert progress.fraction_complete == 1.0
+
+
+def test_a_wedged_job_hits_its_deadline_and_is_marked_failed(monkeypatch, pg_dsn):
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    monkeypatch.setattr(orchestration, "JOB_DEADLINE_SECONDS", 0.2)
+
+    async def never_returns(*args, **kwargs):
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(orchestration, "analyze_channel", never_returns)
+
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            from storage.postgres import create_job
+            job_id = await create_job(conn, "chan-wedged")
+        finally:
+            await conn.close()
+
+        await orchestration._run_claimed_job(
+            job_id, "chan-wedged", youtube_api_key="yt", openrouter_api_key="or",
+        )
+
+        conn2 = await asyncpg.connect(pg_dsn)
+        try:
+            return await get_job_progress(conn2, job_id)
+        finally:
+            await conn2.close()
+
+    progress = _run(scenario())
+    assert progress.status == "failed"
+    assert "limit" in (progress.error or "")
+    assert progress.finished_at is not None
+
+
+def test_a_running_job_heartbeats_so_the_reaper_leaves_it_alone(monkeypatch, pg_dsn):
+    """The heartbeat task must actually beat during a real run -- otherwise
+    reap_stale_jobs would retire live jobs mid-analysis."""
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    calls: dict = {}
+    _install_happy_path_mocks(monkeypatch, video_specs=[("v1", 2)], calls=calls)
+
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            from storage.postgres import create_job
+            job_id = await create_job(conn, "chan-heartbeat")
+        finally:
+            await conn.close()
+
+        await orchestration._run_claimed_job(
+            job_id, "chan-heartbeat", youtube_api_key="yt", openrouter_api_key="or",
+        )
+
+        conn2 = await asyncpg.connect(pg_dsn)
+        try:
+            return await get_job_progress(conn2, job_id)
+        finally:
+            await conn2.close()
+
+    progress = _run(scenario())
+    assert progress.status == "completed"
+    # Claim + every checkpointed batch touches it, so it is set well before
+    # the periodic task's first tick.
+    assert progress.heartbeat_at is not None

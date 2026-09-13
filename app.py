@@ -24,6 +24,7 @@ normal module, with no Streamlit runtime required. `main()` and the
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 
 import altair as alt
@@ -34,6 +35,7 @@ from streamlit_autorefresh import st_autorefresh
 
 import config.models as models
 import evals.benchmark as benchmark
+from harness.preflight import run_preflight
 from ingestion.youtube import (
     QuotaEstimate,
     QuotaExceededError,
@@ -61,8 +63,11 @@ from storage.postgres import (
     get_latest_eval_run,
     get_stage_checkpoint_summary,
     init_schema,
+    reap_stale_jobs,
     save_eval_run,
 )
+
+logger = logging.getLogger(__name__)
 
 REQUIRED_ENV_VARS = ("YOUTUBE_API_KEY", "OPENROUTER_API_KEY", "DATABASE_URL")
 
@@ -150,7 +155,20 @@ async def launch_analysis(
 
 
 async def load_progress(job_id: str) -> JobProgress | None:
+    """Read one job's progress, first retiring any job whose worker died.
+
+    The reap has to happen on this read path specifically: the page polls
+    this every few seconds while a job looks active, so it's the one place
+    guaranteed to run while a zombie is on screen. Without it a job whose
+    background thread died with its container (a redeploy, a sleep, an OOM
+    kill) sits at 'running' forever and the page spins on it indefinitely
+    with a Cancel button that has nothing left to cancel — observed live,
+    2026-09-13.
+    """
     async with connect() as conn:
+        reaped = await reap_stale_jobs(conn)
+        if reaped:
+            logger.warning("Reaped %d stale running job(s) with no live worker", reaped)
         return await get_job_progress(conn, job_id)
 
 
@@ -361,6 +379,71 @@ def _render_models_in_use() -> None:
         )
 
 
+def _render_preflight_section() -> None:
+    """harness/preflight.py, runnable from inside the deployment.
+
+    Deliberately available here rather than only as a CLI: the seams this
+    checks (OpenRouter reachability and credit, model slugs that providers
+    withdraw without notice, the live embedding width, Postgres over
+    whichever network path this host actually uses) are properties of
+    *this running environment*, and a laptop passing them proves nothing
+    about production. Every failure this project hit on its first live day
+    would have been caught by pressing this button first.
+    """
+    with st.expander("🔧 Preflight diagnostics — verify every seam before spending"):
+        st.caption(
+            "Probes each external dependency through the real pipeline code: "
+            "Postgres round-trip, YouTube key/quota, OpenRouter credit, and every "
+            "configured model (primaries **and** fallbacks) with 2-3 synthetic "
+            "comments each. Costs a fraction of a cent and reports exactly what it spent."
+        )
+        if st.button("Run preflight checks", key="run_preflight"):
+            with st.spinner("Probing every seam against its real provider…"):
+                try:
+                    report = _run_async(run_preflight())
+                except Exception as exc:  # noqa: BLE001 -- show it, don't crash the page
+                    st.error(f"Preflight could not run: {type(exc).__name__}: {exc}")
+                    return
+            st.session_state["preflight_report"] = report
+
+        report = st.session_state.get("preflight_report")
+        if report is None:
+            st.caption("Not run yet — click above to verify this deployment end to end.")
+            return
+
+        if report.ready:
+            st.success("READY — every seam verified against its real provider.")
+        elif report.failed:
+            st.error(
+                f"NOT READY — {len(report.failed)} check(s) failed. "
+                "A real analysis would hit these too."
+            )
+        else:
+            st.warning(
+                "PARTIAL — nothing failed, but skipped checks are unproven seams, "
+                "not passing ones."
+            )
+
+        icons = {"PASS": "✅", "FAIL": "❌", "WARN": "⚠️", "SKIP": "⏭️"}
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "": icons.get(r.status, ""),
+                        "Check": r.name,
+                        "Detail": r.detail,
+                        "Seconds": round(r.seconds, 2),
+                    }
+                    for r in report.results
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+        if report.credits_spent is not None:
+            st.caption(f"OpenRouter credit spent by this run: ${report.credits_spent:.6f}")
+
+
 def _render_eval_section() -> None:
     """"Metrics Usage" — a real accuracy number and confusion matrix,
     computed live against the deployed model on a hand-labeled benchmark
@@ -432,6 +515,7 @@ def main() -> None:
         st.stop()
 
     _render_models_in_use()
+    _render_preflight_section()
     _render_eval_section()
 
     channel_ref = st.text_input(

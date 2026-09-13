@@ -102,9 +102,11 @@ def test_page_renders_title_and_input_when_configured(monkeypatch):
     assert not at.exception
     assert at.title[0].value == "🎥 Audience Mood Analyzer"
     assert len(at.text_input) == 1
-    # The Analyze button, plus the eval section's "Run live accuracy
-    # benchmark" button (_render_eval_section) -- see module docstring.
-    assert len(at.button) == 2
+    # Assert on the keys that must exist rather than a total count: a raw
+    # count breaks every time a diagnostics panel is added (it already has,
+    # twice), which tells you nothing about whether the page is correct.
+    keys = {b.key for b in at.button}
+    assert {"analyze_button", "run_eval_benchmark", "run_preflight"} <= keys
     assert _analyze_button(at) is not None
 
 

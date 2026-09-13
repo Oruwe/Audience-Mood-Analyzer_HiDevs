@@ -49,14 +49,16 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     error                TEXT,
     claimed_at           TIMESTAMPTZ,
     started_at           TIMESTAMPTZ,
+    heartbeat_at         TIMESTAMPTZ,
     finished_at          TIMESTAMPTZ,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Idempotent migration for installations created before total_comment_count
+-- Idempotent migrations for installations created before these columns
 -- existed (this sandbox's own dev database, notably).
 ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS total_comment_count INTEGER;
+ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS analysis_job_batches (
     job_id       UUID NOT NULL REFERENCES analysis_jobs(id) ON DELETE CASCADE,
@@ -190,6 +192,54 @@ async def finish_job(
     )
 
 
+async def touch_heartbeat(conn: asyncpg.Connection, job_id: str) -> None:
+    """Mark *job_id* as still being actively worked on right now.
+
+    The background thread running a job dies with its container — a Render
+    redeploy, a Streamlit Cloud sleep, an OOM kill. Nothing restarts it, so
+    without this the job's row sits at status='running' forever and the UI
+    polls a corpse (observed live, 2026-09-13: a job whose thread was gone
+    kept the page in its "analyzing…" spinner indefinitely, and the Cancel
+    button had nothing left to cancel). `reap_stale_jobs` uses this column
+    to tell "still working" apart from "process died mid-run".
+    """
+    await conn.execute(
+        "UPDATE analysis_jobs SET heartbeat_at = now(), updated_at = now() WHERE id = $1",
+        job_id,
+    )
+
+
+async def reap_stale_jobs(conn: asyncpg.Connection, *, stale_after_seconds: int = 300) -> int:
+    """Fail any 'running' job whose heartbeat stopped more than
+    *stale_after_seconds* ago, and return how many were reaped.
+
+    A job that is genuinely working refreshes its heartbeat every batch, so
+    a heartbeat older than several minutes means the worker is gone, not
+    slow. Jobs claimed before this column existed (heartbeat_at IS NULL)
+    fall back to `claimed_at` so pre-upgrade zombies get cleaned up too.
+
+    Deliberately marks them 'failed' rather than silently resuming: the
+    checkpoints are all still in Postgres, so the user's next run of the
+    same channel reuses that work (SPEC §8 idempotency) — but the UI must
+    stop pretending a dead job is live.
+    """
+    result = await conn.execute(
+        """
+        UPDATE analysis_jobs
+        SET status = 'failed',
+            error = COALESCE(error,
+                'Worker stopped responding (the app restarted or slept mid-analysis). '
+                'Completed work was checkpointed — starting the same analysis again resumes it.'),
+            finished_at = now(),
+            updated_at = now()
+        WHERE status = 'running'
+          AND COALESCE(heartbeat_at, claimed_at, created_at) < now() - ($1 || ' seconds')::interval
+        """,
+        str(stale_after_seconds),
+    )
+    return int(result.removeprefix("UPDATE ").strip() or 0)
+
+
 async def request_cancellation(conn: asyncpg.Connection, job_id: str) -> None:
     await conn.execute(
         "UPDATE analysis_jobs SET cancel_requested = TRUE, updated_at = now() WHERE id = $1",
@@ -280,6 +330,7 @@ class JobProgress:
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+    heartbeat_at: datetime | None = None
 
     @property
     def fraction_complete(self) -> float | None:
@@ -305,6 +356,7 @@ async def get_job_progress(conn: asyncpg.Connection, job_id: str) -> JobProgress
         created_at=row["created_at"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
+        heartbeat_at=row["heartbeat_at"],
     )
 
 

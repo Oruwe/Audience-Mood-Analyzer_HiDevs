@@ -411,6 +411,25 @@ account-delete path on day one — you need it for Google verification anyway.
 Four layers. Layers 1–3 are deterministic tests. Layer 4 is evals — scored, drifting, not pass/fail.
 Do not conflate them.
 
+**L0 — Preflight (added 2026-09-13, `harness/preflight.py`).** The layer this spec was missing, and
+the gap cost a full day of live debugging to notice. L1–L3 all mock the provider, so every failure
+this project actually hit in production was invisible to them: a model slug the registry listed but
+the provider had withdrawn, litellm's routing prefix sent verbatim to a REST endpoint that has never
+heard of it, an embedding width documented but never once verified against a live response, a
+transient error shape the retry logic didn't recognise, a Postgres reachable over one network path
+and not another. Each of those is a *seam* failure, each cost a failed run to discover, and each is
+a ten-second check — that asymmetry is the entire argument for this layer.
+
+Preflight probes every seam through the **real pipeline code** (not a lookalike), with 2–3 synthetic
+comments per model, and reports what it actually spent by reading OpenRouter's own credit endpoint
+before and after. It checks both primaries **and** fallbacks — insurance nobody has ever tested is
+not insurance. Rules: never abort on first failure (one run tells you everything that's broken); a
+SKIP is never counted as a PASS (an unproven seam is exactly what this exists to make visible).
+
+Run it `python -m harness.preflight` (`--offline` for the $0 subset), or from the deployed app's
+diagnostics panel — which is usually the more useful place, since these are properties of *the
+running environment*, and a laptop passing them proves nothing about production.
+
 **L1 — Unit, no network.** Normalizer, fingerprinting, quota arithmetic, batch splitting, divergence
 quadrant logic. Port V2's `run_test.py` checks. Sub-2s, every commit.
 

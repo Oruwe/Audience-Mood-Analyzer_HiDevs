@@ -77,6 +77,7 @@ from storage.postgres import (
     record_batch_result,
     request_cancellation,
     set_total_comment_count,
+    touch_heartbeat,
     update_job_progress,
 )
 
@@ -89,9 +90,56 @@ STAGE_CLASSIFY = "stage_b"
 STAGE_INSIGHTS = "stage_c"
 _INSIGHTS_BATCH_KEY = "insights"  # Stage C is checkpointed as a single unit -- see module docstring
 
+# SPEC §8 named `asyncio.Semaphore` over batch calls as part of the
+# concurrency design. When per-stage batches were first made concurrent
+# this cap was left off, reasoned as "batch counts per stage are small and
+# bounded by construction" -- which is wrong: batch count scales with a
+# channel's comment count, so a large channel fires one request per 50
+# comments *simultaneously*. At a few thousand comments that's ~100 open
+# HTTPS requests at once, which trips provider rate limits that wouldn't
+# otherwise fire, exhausts httpx's connection pool, and spikes memory on a
+# 512 MB instance. 8 is comfortably above what's needed to hide per-call
+# latency and comfortably below any of those ceilings.
+MAX_CONCURRENT_BATCHES = 8
+
+# Network timeouts for the shared httpx client (YouTube pagination and the
+# OpenRouter embeddings endpoint). httpx's default is 5s for *every* phase,
+# which is far too tight for an embeddings call carrying 100 comments --
+# it turns a normal slow response into a spurious timeout, a retry, and a
+# multiplied wall-clock cost. Connect stays short (a genuinely unreachable
+# host should fail fast); read/write are generous.
+HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
+
+# A job that has not finished within this long is not "slow", it is stuck:
+# no single analysis at this project's scale legitimately runs an hour, and
+# an unbounded job can never be cancelled, reaped, or retried -- it just
+# holds its row at 'running' forever. `_run_claimed_job` enforces it.
+JOB_DEADLINE_SECONDS = 900  # 15 minutes
+
+# How often the background heartbeat task marks a running job as alive.
+# Must stay well under storage.postgres.reap_stale_jobs' staleness window.
+HEARTBEAT_INTERVAL_SECONDS = 30
+
 
 class JobCancelledError(RuntimeError):
     """Raised to unwind a job's loop once cancellation is observed."""
+
+
+class JobDeadlineExceededError(RuntimeError):
+    """The job exceeded JOB_DEADLINE_SECONDS and was abandoned."""
+
+
+async def _bounded_gather(coros, *, limit: int = MAX_CONCURRENT_BATCHES):
+    """`asyncio.gather`, but with at most *limit* of them in flight —
+    SPEC §8's "asyncio.Semaphore over batch calls". See
+    MAX_CONCURRENT_BATCHES for why the cap is not optional."""
+    semaphore = asyncio.Semaphore(limit)
+
+    async def _guarded(coro):
+        async with semaphore:
+            return await coro
+
+    return await asyncio.gather(*(_guarded(c) for c in coros))
 
 
 @dataclass
@@ -119,6 +167,16 @@ async def _run_ingestion(
     cached = await get_batch_results(conn, job_id, STAGE_INGESTION)
     comments: list[RawComment] = []
 
+    # Count work already checkpointed by an earlier attempt, so a resumed
+    # job's progress bar starts where it left off instead of at 0/N and
+    # never reaching N (it skips those batches, so nothing would ever
+    # increment for them).
+    already_done = sum(1 for video in estimate.videos if video.video_id in done)
+    await update_job_progress(
+        conn, job_id, stage=STAGE_INGESTION,
+        total_units=len(estimate.videos), completed_units=already_done,
+    )
+
     for video in estimate.videos:
         await _check_cancel(conn, job_id)
         if video.video_id in done:
@@ -141,6 +199,7 @@ async def _run_ingestion(
             result={"comments": [c.model_dump(mode="json") for c in video_comments]},
         )
         await increment_completed_units(conn, job_id, by=1)
+        await touch_heartbeat(conn, job_id)
         comments.extend(video_comments)
     return comments
 
@@ -174,6 +233,19 @@ async def _run_checkpointed_pydantic_batches(
         for raw in payload["items"]
     }
 
+    all_keys = [str(start) for start in range(0, len(comments), batch_size)]
+    pending = [
+        (key, comments[int(key) : int(key) + batch_size])
+        for key in all_keys
+        if key not in done
+    ]
+    # Resumed jobs skip already-checkpointed batches, so seed the counter
+    # with them rather than starting at 0 and never reaching total.
+    await update_job_progress(
+        conn, job_id, stage=stage,
+        total_units=len(all_keys), completed_units=len(all_keys) - len(pending),
+    )
+
     await _check_cancel(conn, job_id)
     db_lock = asyncio.Lock()
 
@@ -185,14 +257,12 @@ async def _run_checkpointed_pydantic_batches(
                 result={"items": [item.model_dump(mode="json") for item in batch_result.values()]},
             )
             await increment_completed_units(conn, job_id, by=1)
+            await touch_heartbeat(conn, job_id)
         return batch_result
 
-    pending = [
-        (str(start), comments[start : start + batch_size])
-        for start in range(0, len(comments), batch_size)
-        if str(start) not in done
-    ]
-    for batch_result in await asyncio.gather(*(_run_one(key, batch) for key, batch in pending)):
+    for batch_result in await _bounded_gather(
+        [_run_one(key, batch) for key, batch in pending]
+    ):
         results.update(batch_result)
     return results
 
@@ -208,6 +278,17 @@ async def _run_stage_a_embeddings(
     for payload in cached.values():
         results.update(payload["vectors"])
 
+    all_keys = [str(start) for start in range(0, len(comments), DEFAULT_EMBEDDING_BATCH_SIZE)]
+    pending = [
+        (key, comments[int(key) : int(key) + DEFAULT_EMBEDDING_BATCH_SIZE])
+        for key in all_keys
+        if key not in done
+    ]
+    await update_job_progress(
+        conn, job_id, stage=STAGE_EMBEDDING,
+        total_units=len(all_keys), completed_units=len(all_keys) - len(pending),
+    )
+
     await _check_cancel(conn, job_id)
     db_lock = asyncio.Lock()
 
@@ -216,20 +297,14 @@ async def _run_stage_a_embeddings(
         async with db_lock:
             await record_batch_result(conn, job_id, STAGE_EMBEDDING, batch_key, result={"vectors": vectors})
             await increment_completed_units(conn, job_id, by=1)
+            await touch_heartbeat(conn, job_id)
         return vectors
 
-    pending = [
-        (str(start), comments[start : start + DEFAULT_EMBEDDING_BATCH_SIZE])
-        for start in range(0, len(comments), DEFAULT_EMBEDDING_BATCH_SIZE)
-        if str(start) not in done
-    ]
-    for vectors in await asyncio.gather(*(_run_one(key, batch) for key, batch in pending)):
+    for vectors in await _bounded_gather(
+        [_run_one(key, batch) for key, batch in pending]
+    ):
         results.update(vectors)
     return results
-
-
-def _n_batches(n_items: int, batch_size: int) -> int:
-    return -(-n_items // batch_size) if n_items else 0
 
 
 async def _run_stage_c(
@@ -238,7 +313,16 @@ async def _run_stage_c(
 ) -> ChannelInsights:
     """Stage C, checkpointed as one unit (see module docstring)."""
     done = await get_completed_batch_keys(conn, job_id, STAGE_INSIGHTS)
-    if _INSIGHTS_BATCH_KEY in done:
+    already_done = _INSIGHTS_BATCH_KEY in done
+    # Set progress here rather than in the caller, for the same reason as
+    # the other stages: only this function knows whether the single unit is
+    # already checkpointed, and a resumed job that skips it would otherwise
+    # report 0/1 forever.
+    await update_job_progress(
+        conn, job_id, stage=STAGE_INSIGHTS,
+        total_units=1, completed_units=1 if already_done else 0,
+    )
+    if already_done:
         cached = await get_batch_results(conn, job_id, STAGE_INSIGHTS)
         return ChannelInsights.model_validate(cached[_INSIGHTS_BATCH_KEY])
 
@@ -249,6 +333,7 @@ async def _run_stage_c(
         conn, job_id, STAGE_INSIGHTS, _INSIGHTS_BATCH_KEY, result=result.model_dump(mode="json"),
     )
     await increment_completed_units(conn, job_id, by=1)
+    await touch_heartbeat(conn, job_id)
     return result
 
 
@@ -274,14 +359,10 @@ async def analyze_channel(
         ledger = QuotaLedger()
         dedup = ContentDeduplicator()
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             estimate = await estimate_channel_analysis(
                 channel_ref, client=client, api_key=youtube_api_key,
                 ledger=ledger, max_videos=max_videos,
-            )
-            await update_job_progress(
-                conn, job_id, stage=STAGE_INGESTION, total_units=len(estimate.videos),
-                completed_units=0,
             )
             comments = await _run_ingestion(
                 conn, job_id, estimate, client=client, youtube_api_key=youtube_api_key,
@@ -294,11 +375,6 @@ async def analyze_channel(
             await set_total_comment_count(conn, job_id, len(comments))
 
             await _check_cancel(conn, job_id)
-            await update_job_progress(
-                conn, job_id, stage=STAGE_SENTIMENT,
-                total_units=_n_batches(len(comments), DEFAULT_SENTIMENT_BATCH_SIZE),
-                completed_units=0,
-            )
             sentiments = await _run_checkpointed_pydantic_batches(
                 conn, job_id, STAGE_SENTIMENT, comments, DEFAULT_SENTIMENT_BATCH_SIZE,
                 item_model=StageASentimentItem,
@@ -306,22 +382,12 @@ async def analyze_channel(
             )
 
             await _check_cancel(conn, job_id)
-            await update_job_progress(
-                conn, job_id, stage=STAGE_EMBEDDING,
-                total_units=_n_batches(len(comments), DEFAULT_EMBEDDING_BATCH_SIZE),
-                completed_units=0,
-            )
             embeddings = await _run_stage_a_embeddings(
                 conn, job_id, comments, client=client, api_key=openrouter_api_key
             )
 
             await _check_cancel(conn, job_id)
             flagged = select_for_stage_b(comments, sentiments, embeddings)
-            await update_job_progress(
-                conn, job_id, stage=STAGE_CLASSIFY,
-                total_units=_n_batches(len(flagged), STAGE_B_BATCH_SIZE),
-                completed_units=0,
-            )
             stage_b_results = await _run_checkpointed_pydantic_batches(
                 conn, job_id, STAGE_CLASSIFY, flagged, STAGE_B_BATCH_SIZE,
                 item_model=StageBClassificationItem,
@@ -330,7 +396,6 @@ async def analyze_channel(
 
             await _check_cancel(conn, job_id)
             video_titles = {v.video_id: v.title for v in estimate.videos}
-            await update_job_progress(conn, job_id, stage=STAGE_INSIGHTS, total_units=1, completed_units=0)
             insights = await _run_stage_c(
                 conn, job_id, comments, sentiments, stage_b_results, embeddings, video_titles,
                 api_key=openrouter_api_key,
@@ -343,24 +408,69 @@ async def analyze_channel(
     )
 
 
+async def _heartbeat_loop(job_id: str, interval: float = HEARTBEAT_INTERVAL_SECONDS) -> None:
+    """Mark *job_id* alive every *interval* seconds until cancelled.
+
+    Runs on its own connection: the job's own connection is busy (and
+    serialized behind a lock during concurrent stages), and asyncpg does
+    not allow concurrent queries on one connection. Per-batch heartbeats
+    alone aren't enough — a stage that hangs mid-call would stop
+    heartbeating and get reaped as dead even though the process is fine.
+    This ticks regardless of what the pipeline is doing, so the heartbeat
+    means exactly one thing: *this process is still alive*. Detecting a
+    process that is alive but wedged is JOB_DEADLINE_SECONDS' job, not
+    this one's.
+    """
+    try:
+        async with connect() as conn:
+            while True:
+                await asyncio.sleep(interval)
+                await touch_heartbeat(conn, job_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 -- a failing heartbeat must never fail the job
+        logger.warning("Heartbeat for job %s stopped early", job_id, exc_info=True)
+
+
 async def _run_claimed_job(
     job_id: str, channel_ref: str, *, youtube_api_key: str, openrouter_api_key: str,
 ) -> None:
     async with connect() as conn:
         await init_schema(conn)
         claimed = await claim_job(conn, job_id)
+        if claimed:
+            await touch_heartbeat(conn, job_id)
     if not claimed:
         logger.info("Job %s already claimed/running/finished elsewhere; skipping", job_id)
         return
 
+    heartbeat = asyncio.create_task(_heartbeat_loop(job_id))
     try:
-        await analyze_channel(
-            job_id, channel_ref,
-            youtube_api_key=youtube_api_key, openrouter_api_key=openrouter_api_key,
+        # A wedged job must fail, not hang: without this it holds 'running'
+        # forever, uncancellable (cancellation is cooperative and a wedged
+        # await never reaches the next check) and un-reapable (the
+        # heartbeat above keeps proving the *process* is alive).
+        await asyncio.wait_for(
+            analyze_channel(
+                job_id, channel_ref,
+                youtube_api_key=youtube_api_key, openrouter_api_key=openrouter_api_key,
+            ),
+            timeout=JOB_DEADLINE_SECONDS,
         )
     except JobCancelledError:
         async with connect() as conn:
             await finish_job(conn, job_id, status="cancelled")
+    except (TimeoutError, asyncio.TimeoutError):
+        logger.error("Job %s exceeded its %ss deadline", job_id, JOB_DEADLINE_SECONDS)
+        async with connect() as conn:
+            await finish_job(
+                conn, job_id, status="failed",
+                error=(
+                    f"Analysis exceeded its {JOB_DEADLINE_SECONDS // 60}-minute limit and was "
+                    "stopped. Completed work was checkpointed — running the same analysis "
+                    "again resumes from where it stopped."
+                ),
+            )
     except Exception as exc:  # noqa: BLE001 -- a job must never stay stuck 'running'
         logger.exception("Job %s failed", job_id)
         async with connect() as conn:
@@ -368,6 +478,12 @@ async def _run_claimed_job(
     else:
         async with connect() as conn:
             await finish_job(conn, job_id, status="completed")
+    finally:
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
 
 
 def run_job_in_background(
