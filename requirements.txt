@@ -3,13 +3,12 @@ litellm
 instructor
 pydantic
 python-dotenv
-
-# Ingestion & Async
-websockets>=12.0
+tenacity
 
 # Storage & Observability
 pytz>=2024.1
 langfuse
+asyncpg
 
 # UI & Evals
 streamlit

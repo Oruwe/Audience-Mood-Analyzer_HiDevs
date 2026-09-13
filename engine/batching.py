@@ -20,8 +20,17 @@ from __future__ import annotations
 import logging
 
 from litellm import acompletion
+from litellm.exceptions import (
+    APIConnectionError,
+    BadGatewayError,
+    InternalServerError,
+    RateLimitError,
+    ServiceUnavailableError,
+    Timeout,
+)
 from pydantic import BaseModel, ValidationError
 
+from resilience import retry_transient
 from schemas import RawComment
 
 logger = logging.getLogger(__name__)
@@ -39,6 +48,23 @@ def _parse(raw_content: str, response_schema: type[BaseModel]) -> BaseModel | No
         return response_schema.model_validate_json(raw_content)
     except (ValidationError, ValueError):
         return None
+
+
+# SPEC §8: "Retries: tenacity, exponential backoff + jitter, on ... OpenRouter
+# calls." Only these -- a genuine bad request, auth failure, or content-policy
+# rejection must fail immediately, not retry into a slower failure.
+@retry_transient(
+    RateLimitError, ServiceUnavailableError, Timeout,
+    APIConnectionError, InternalServerError, BadGatewayError,
+)
+async def _call_model(model: str, api_key: str, messages: list[dict], response_schema: type[BaseModel]):
+    return await acompletion(
+        model=model,
+        api_key=api_key,
+        messages=messages,
+        response_format=response_schema,
+        timeout=30,
+    )
 
 
 async def run_batched_llm_classification(
@@ -66,13 +92,7 @@ async def run_batched_llm_classification(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": lines},
     ]
-    response = await acompletion(
-        model=model,
-        api_key=api_key,
-        messages=messages,
-        response_format=response_schema,
-        timeout=30,
-    )
+    response = await _call_model(model, api_key, messages, response_schema)
     parsed = _parse(response.choices[0].message.content, response_schema)
 
     expected_ids = {c.id for c in comments}

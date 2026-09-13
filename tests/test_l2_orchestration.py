@@ -1,0 +1,293 @@
+"""L2/L3 integration tests — orchestration.py (SPEC §8) against a real
+Postgres (tests/conftest.py's `pg_dsn`, skips cleanly if unreachable), with
+ingestion/Stage A/Stage B mocked out (no network, no API keys) so these
+tests exercise the orchestration wiring itself: checkpointing, resume,
+cancellation, atomic claim, and progress reporting.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+
+import pytest
+
+import orchestration
+from ingestion.youtube import ChannelInfo, QuotaEstimate, VideoMeta
+from schemas import CommentIntent, RawComment, Sentiment, StageASentimentItem, StageBClassificationItem
+from storage.postgres import get_job_progress, init_schema
+import asyncpg
+
+
+def _estimate(video_specs: list[tuple[str, int]]) -> QuotaEstimate:
+    videos = [VideoMeta(video_id=vid, title=f"Video {vid}", comment_count=n) for vid, n in video_specs]
+    return QuotaEstimate(
+        channel=ChannelInfo(channel_id="UCabc", title="Test Channel",
+                             uploads_playlist_id="UUabc", video_count=len(videos)),
+        videos=videos,
+        total_comment_count=sum(n for _, n in video_specs),
+        units_already_spent_on_estimate=1,
+        units_required_for_comment_pull=len(videos),
+    )
+
+
+def _comment(video_id: str, i: int) -> RawComment:
+    return RawComment(
+        id=f"{video_id}-c{i}", platform="youtube", text=f"comment {i} on {video_id}",
+        timestamp=datetime.now(timezone.utc), video_id=video_id,
+    )
+
+
+def _install_happy_path_mocks(monkeypatch, *, video_specs, calls):
+    async def fake_estimate(channel_ref, **kwargs):
+        calls.setdefault("estimate", 0)
+        calls["estimate"] += 1
+        return _estimate(video_specs)
+
+    async def fake_fetch_video_comments(video_id, **kwargs):
+        calls.setdefault("fetch_video", []).append(video_id)
+        n = dict(video_specs)[video_id]
+        for i in range(n):
+            yield _comment(video_id, i)
+
+    async def fake_classify_sentiment_batch(batch, *, api_key, model=None):
+        calls.setdefault("sentiment_batches", []).append([c.id for c in batch])
+        return {
+            c.id: StageASentimentItem(comment_id=c.id, sentiment=Sentiment.NEUTRAL, confidence=0.9)
+            for c in batch
+        }
+
+    async def fake_embed_comments_batch(batch, *, client, api_key, model=None):
+        calls.setdefault("embed_batches", []).append([c.id for c in batch])
+        return {c.id: [float(i), 0.0] for i, c in enumerate(batch)}
+
+    async def fake_stage_b_classify_batch(batch, *, api_key, model=None):
+        calls.setdefault("stage_b_batches", []).append([c.id for c in batch])
+        return {
+            c.id: StageBClassificationItem(
+                comment_id=c.id, intent=CommentIntent.OTHER, is_request=False, is_confusion=False
+            )
+            for c in batch
+        }
+
+    monkeypatch.setattr(orchestration, "estimate_channel_analysis", fake_estimate)
+    monkeypatch.setattr(orchestration, "fetch_video_comments", fake_fetch_video_comments)
+    monkeypatch.setattr(orchestration, "classify_sentiment_batch", fake_classify_sentiment_batch)
+    monkeypatch.setattr(orchestration, "embed_comments_batch", fake_embed_comments_batch)
+    monkeypatch.setattr(orchestration, "stage_b_classify_batch", fake_stage_b_classify_batch)
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_analyze_channel_happy_path(monkeypatch, pg_dsn):
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    calls: dict = {}
+    video_specs = [("v1", 2), ("v2", 3)]
+    _install_happy_path_mocks(monkeypatch, video_specs=video_specs, calls=calls)
+
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            from storage.postgres import create_job
+            job_id = await create_job(conn, "chan")
+        finally:
+            await conn.close()
+
+        result = await orchestration.analyze_channel(
+            job_id, "chan", youtube_api_key="yt-key", openrouter_api_key="or-key",
+        )
+        return job_id, result
+
+    job_id, result = _run(scenario())
+
+    assert len(result.comments) == 5
+    assert set(result.sentiments.keys()) == {c.id for c in result.comments}
+    assert set(result.embeddings.keys()) == {c.id for c in result.comments}
+    # all comments are high-confidence (0.9) -> all flagged for Stage B
+    assert set(result.stage_b.keys()) == {c.id for c in result.comments}
+    assert calls["fetch_video"] == ["v1", "v2"]
+
+
+def test_resuming_skips_already_checkpointed_ingestion(monkeypatch, pg_dsn):
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    calls: dict = {}
+    video_specs = [("v1", 2), ("v2", 3)]
+    _install_happy_path_mocks(monkeypatch, video_specs=video_specs, calls=calls)
+
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            from storage.postgres import create_job
+            job_id = await create_job(conn, "chan")
+        finally:
+            await conn.close()
+
+        # First run: full pipeline.
+        await orchestration.analyze_channel(
+            job_id, "chan", youtube_api_key="yt-key", openrouter_api_key="or-key",
+        )
+        first_fetch_calls = list(calls["fetch_video"])
+        first_sentiment_calls = len(calls["sentiment_batches"])
+
+        # Second run, same job_id: everything should be a checkpoint hit.
+        await orchestration.analyze_channel(
+            job_id, "chan", youtube_api_key="yt-key", openrouter_api_key="or-key",
+        )
+        return first_fetch_calls, first_sentiment_calls
+
+    first_fetch_calls, first_sentiment_calls = _run(scenario())
+
+    assert first_fetch_calls == ["v1", "v2"]
+    # No new fetch_video_comments calls on the second run -- ingestion was
+    # fully checkpointed.
+    assert calls["fetch_video"] == ["v1", "v2"]
+    # No new sentiment batches either.
+    assert len(calls["sentiment_batches"]) == first_sentiment_calls
+
+
+def test_cancellation_stops_the_job_between_stages(monkeypatch, pg_dsn):
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    calls: dict = {}
+    video_specs = [("v1", 2)]
+    _install_happy_path_mocks(monkeypatch, video_specs=video_specs, calls=calls)
+
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            from storage.postgres import create_job, request_cancellation
+            job_id = await create_job(conn, "chan")
+            # Cancel before the job even starts -- must stop at the very
+            # first cancellation checkpoint, before any ingestion happens.
+            await request_cancellation(conn, job_id)
+        finally:
+            await conn.close()
+
+        with pytest.raises(orchestration.JobCancelledError):
+            await orchestration.analyze_channel(
+                job_id, "chan", youtube_api_key="yt-key", openrouter_api_key="or-key",
+            )
+        return job_id
+
+    job_id = _run(scenario())
+    assert "fetch_video" not in calls  # never got past the first cancel check
+
+
+def test_run_claimed_job_marks_completed_on_success(monkeypatch, pg_dsn):
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    calls: dict = {}
+    _install_happy_path_mocks(monkeypatch, video_specs=[("v1", 1)], calls=calls)
+
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            from storage.postgres import create_job
+            job_id = await create_job(conn, "chan")
+        finally:
+            await conn.close()
+
+        await orchestration._run_claimed_job(
+            job_id, "chan", youtube_api_key="yt-key", openrouter_api_key="or-key",
+        )
+
+        conn2 = await asyncpg.connect(pg_dsn)
+        try:
+            return await get_job_progress(conn2, job_id)
+        finally:
+            await conn2.close()
+
+    progress = _run(scenario())
+    assert progress.status == "completed"
+    assert progress.finished_at is not None
+
+
+def test_run_claimed_job_marks_failed_on_exception(monkeypatch, pg_dsn):
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("YouTube is on fire")
+
+    monkeypatch.setattr(orchestration, "estimate_channel_analysis", boom)
+
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            from storage.postgres import create_job
+            job_id = await create_job(conn, "chan")
+        finally:
+            await conn.close()
+
+        await orchestration._run_claimed_job(
+            job_id, "chan", youtube_api_key="yt-key", openrouter_api_key="or-key",
+        )
+
+        conn2 = await asyncpg.connect(pg_dsn)
+        try:
+            return await get_job_progress(conn2, job_id)
+        finally:
+            await conn2.close()
+
+    progress = _run(scenario())
+    assert progress.status == "failed"
+    assert "YouTube is on fire" in progress.error
+
+
+def test_run_claimed_job_is_a_no_op_if_already_claimed(monkeypatch, pg_dsn):
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    calls: dict = {}
+    _install_happy_path_mocks(monkeypatch, video_specs=[("v1", 1)], calls=calls)
+
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            from storage.postgres import claim_job, create_job
+            job_id = await create_job(conn, "chan")
+            # Pre-claim the job, simulating another runner already owning it.
+            already_claimed = await claim_job(conn, job_id)
+            assert already_claimed is True
+        finally:
+            await conn.close()
+
+        # _run_claimed_job must see status != 'pending' and refuse to run
+        # the pipeline at all.
+        await orchestration._run_claimed_job(
+            job_id, "chan", youtube_api_key="yt-key", openrouter_api_key="or-key",
+        )
+        return job_id
+
+    _run(scenario())
+    assert "fetch_video" not in calls
+
+
+def test_start_analysis_and_cancel_analysis_wire_through(monkeypatch, pg_dsn):
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    calls: dict = {}
+    _install_happy_path_mocks(monkeypatch, video_specs=[("v1", 1)], calls=calls)
+
+    # Avoid actually spawning a background thread in this test -- just
+    # prove start_analysis creates the row and returns a usable job_id, and
+    # cancel_analysis flips the flag storage.postgres already tests directly.
+    monkeypatch.setattr(orchestration, "run_job_in_background", lambda *a, **kw: None)
+
+    async def scenario():
+        job_id = await orchestration.start_analysis(
+            "https://youtube.com/@testchan", youtube_api_key="yt-key", openrouter_api_key="or-key",
+        )
+        await orchestration.cancel_analysis(job_id)
+
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            return await get_job_progress(conn, job_id)
+        finally:
+            await conn.close()
+
+    progress = _run(scenario())
+    assert progress.status == "pending"  # background thread never actually ran
+    assert progress.cancel_requested is True

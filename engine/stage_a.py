@@ -43,6 +43,7 @@ import httpx
 
 from config.models import STAGE_A_EMBEDDINGS, STAGE_A_SENTIMENT
 from engine.batching import BatchClassificationFailedError, classify_all_batches
+from resilience import retry_transient
 from schemas import RawComment, StageASentimentBatch, StageASentimentItem
 
 OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
@@ -85,6 +86,29 @@ class EmbeddingAPIError(StageAError):
         self.status_code = status_code
         self.body = body
         super().__init__(f"OpenRouter embeddings -> HTTP {status_code}: {body[:500]}")
+
+
+class TransientEmbeddingError(EmbeddingAPIError):
+    """A 429/5xx from the embeddings endpoint — SPEC §8: worth retrying."""
+
+
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+@retry_transient(TransientEmbeddingError, httpx.TransportError, httpx.TimeoutException)
+async def _post_embeddings(
+    client: httpx.AsyncClient, api_key: str, model: str, texts: list[str]
+) -> dict:
+    response = await client.post(
+        OPENROUTER_EMBEDDINGS_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={"model": model, "input": texts},
+    )
+    if response.status_code in _RETRYABLE_STATUS:
+        raise TransientEmbeddingError(response.status_code, response.text)
+    if response.status_code != 200:
+        raise EmbeddingAPIError(response.status_code, response.text)
+    return response.json()
 
 
 async def classify_sentiment_batch(
@@ -145,15 +169,8 @@ async def embed_comments_batch(
     if not comments:
         return {}
 
-    response = await client.post(
-        OPENROUTER_EMBEDDINGS_URL,
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={"model": model, "input": [c.text for c in comments]},
-    )
-    if response.status_code != 200:
-        raise EmbeddingAPIError(response.status_code, response.text)
-
-    items = response.json().get("data", [])
+    data = await _post_embeddings(client, api_key, model, [c.text for c in comments])
+    items = data.get("data", [])
     if len(items) != len(comments):
         raise EmbeddingArrayLengthMismatchError(expected=len(comments), got=len(items))
 

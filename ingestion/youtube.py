@@ -13,9 +13,11 @@ this module uses (`channels.list`, `playlistItems.list`, `videos.list`,
 used — see `_UNRESOLVABLE_CUSTOM_URL_HINT` below for what that costs a user
 who pastes a legacy `/c/CustomName` URL.
 
-No retries here yet. SPEC §8 (Orchestration, a later phase) adds
-`tenacity`-based exponential backoff around the YouTube and OpenRouter
-calls; adding that dependency now would be jumping ahead of its phase.
+Retries (SPEC §8, added in Phase 6): `_get` retries a 429 or 5xx response,
+or a transport-level failure, with resilience.retry_transient's exponential
+backoff + jitter. Every other error (400/401/403/404, a quota refusal, an
+unparsable URL) is a real problem, not a transient one, and is never
+retried.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from ingestion.dedup import ContentDeduplicator, fingerprint_text
+from resilience import retry_transient
 from ingestion.normalizer import sanitize_comment_text
 from schemas import RawComment
 
@@ -87,6 +90,16 @@ class YouTubeAPIError(YouTubeIngestionError):
         self.status_code = status_code
         self.body = body
         super().__init__(f"{path} -> HTTP {status_code}: {body[:500]}")
+
+
+class TransientYouTubeError(YouTubeAPIError):
+    """A 429 (rate-limited) or 5xx response — SPEC §8: worth retrying with
+    backoff. Anything else (400, 401, 403, 404, ...) is a real problem, not
+    a transient one, and _get raises the plain YouTubeAPIError for those
+    instead so resilience.retry_transient never retries them."""
+
+
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 
 class QuotaExceededError(YouTubeIngestionError):
@@ -242,10 +255,13 @@ class QuotaLedger:
 # Low-level API access
 # ---------------------------------------------------------------------------
 
+@retry_transient(TransientYouTubeError, httpx.TransportError, httpx.TimeoutException)
 async def _get(client: httpx.AsyncClient, path: str, params: dict, api_key: str) -> dict:
     response = await client.get(
         f"{YOUTUBE_API_BASE}/{path}", params={**params, "key": api_key}
     )
+    if response.status_code in _RETRYABLE_STATUS:
+        raise TransientYouTubeError(path, response.status_code, response.text)
     if response.status_code != 200:
         raise YouTubeAPIError(path, response.status_code, response.text)
     return response.json()
