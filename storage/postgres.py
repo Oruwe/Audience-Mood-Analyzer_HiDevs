@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.parse
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -78,6 +79,28 @@ CREATE INDEX IF NOT EXISTS idx_analysis_jobs_cache_lookup
 """
 
 
+def _with_default_sslmode(dsn: str) -> str:
+    """Add `sslmode=prefer` unless the DSN already specifies one.
+
+    Different hosts this same DATABASE_URL might point at disagree on SSL:
+    this sandbox's local dev Postgres doesn't offer it, Neon/Supabase
+    require it, and a Render Postgres's behavior differs by which network
+    path reaches it (this deploy's own external-network query tool hit a
+    hard "SSL/TLS required" error that the app's internal-network
+    connection may not). `prefer` negotiates SSL when the server offers
+    it and falls back to plaintext when it doesn't, so the same connection
+    string works unmodified against all of them rather than betting on
+    which one applies.
+    """
+    parts = urllib.parse.urlsplit(dsn)
+    query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+    if "sslmode" in query:
+        return dsn
+    query["sslmode"] = ["prefer"]
+    new_query = urllib.parse.urlencode(query, doseq=True)
+    return urllib.parse.urlunsplit(parts._replace(query=new_query))
+
+
 def database_url() -> str:
     url = os.environ.get("DATABASE_URL", "")
     if not url:
@@ -85,7 +108,7 @@ def database_url() -> str:
             "DATABASE_URL is not set (SPEC §4.3: Postgres/Neon for anything "
             "you must not lose). See .env.example."
         )
-    return url
+    return _with_default_sslmode(url)
 
 
 @asynccontextmanager
