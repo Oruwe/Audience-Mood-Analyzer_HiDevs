@@ -24,7 +24,7 @@ or it splits in half and retries.
 
 from __future__ import annotations
 
-from config.models import STAGE_B_CLASSIFY
+from config.models import STAGE_B_CLASSIFY, STAGE_B_CLASSIFY_FALLBACK
 from engine.batching import BatchClassificationFailedError, classify_all_batches
 from schemas import RawComment, StageBClassificationBatch, StageBClassificationItem
 
@@ -56,6 +56,7 @@ async def classify_batch(
     *,
     api_key: str,
     model: str = STAGE_B_CLASSIFY,
+    fallback_models: tuple[str, ...] = (STAGE_B_CLASSIFY_FALLBACK,),
 ) -> dict[str, StageBClassificationItem]:
     """Classify one batch, applying the SPEC §4.1b split-and-retry guard
     (engine.batching — shared with Stage A).
@@ -72,6 +73,7 @@ async def classify_batch(
         stage_label="Stage B",
         batch_size=len(comments) or 1,  # one call for this whole batch, no chunking
         error_cls=ClassificationBatchFailedError,
+        fallback_models=fallback_models,
     )
 
 
@@ -81,6 +83,7 @@ async def classify_all(
     api_key: str,
     model: str = STAGE_B_CLASSIFY,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    fallback_models: tuple[str, ...] = (STAGE_B_CLASSIFY_FALLBACK,),
 ) -> dict[str, StageBClassificationItem]:
     """Classify every comment in *comments*, chunked at *batch_size* per call.
 
@@ -97,4 +100,5 @@ async def classify_all(
         stage_label="Stage B",
         batch_size=batch_size,
         error_cls=ClassificationBatchFailedError,
+        fallback_models=fallback_models,
     )

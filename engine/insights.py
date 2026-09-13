@@ -39,7 +39,7 @@ from litellm.exceptions import (
 from pydantic import BaseModel, ValidationError
 from sklearn.cluster import KMeans
 
-from config.models import STAGE_C_SYNTHESIS
+from config.models import STAGE_C_SYNTHESIS, STAGE_C_SYNTHESIS_FALLBACK
 from resilience import retry_transient
 from schemas import (
     ChannelInsights,
@@ -113,6 +113,29 @@ async def _call_stage_c(model: str, api_key: str, messages: list[dict], response
     )
 
 
+async def _call_stage_c_with_fallback(
+    models: tuple[str, ...], api_key: str, messages: list[dict], response_schema: type[BaseModel],
+):
+    """Same reasoning as engine.batching._call_model_with_fallback: a free
+    OpenRouter model's 429 can outlast _call_stage_c's own retries (a
+    sustained shared-pool exhaustion, not a momentary blip) -- try the next
+    model, from a different vendor, before giving up on this cluster.
+    """
+    last_exc: Exception | None = None
+    for i, model in enumerate(models):
+        try:
+            return await _call_stage_c(model, api_key, messages, response_schema)
+        except (RateLimitError, ServiceUnavailableError) as exc:
+            last_exc = exc
+            if i + 1 < len(models):
+                logger.warning(
+                    "Stage C: %s unavailable after retries (%s); falling back to %s",
+                    model, exc, models[i + 1],
+                )
+    assert last_exc is not None  # unreachable with a non-empty models tuple
+    raise last_exc
+
+
 def _cluster_count(n: int, max_clusters: int) -> int:
     if n < MIN_CLUSTER_SIZE:
         return 1
@@ -141,6 +164,7 @@ def _cluster_comments(
 
 async def _synthesize(
     cluster: list[RawComment], *, api_key: str, model: str, system_prompt: str, draft_schema: type[BaseModel],
+    fallback_models: tuple[str, ...] = (),
 ):
     """One Stage C call for one cluster/sample. Returns None (logged, not
     raised) on any failure — one bad cluster shouldn't sink the whole
@@ -153,7 +177,9 @@ async def _synthesize(
     ]
     corpus = {c.text for c in cluster}
     try:
-        response = await _call_stage_c(model, api_key, messages, draft_schema)
+        response = await _call_stage_c_with_fallback(
+            (model, *fallback_models), api_key, messages, draft_schema
+        )
         return draft_schema.model_validate_json(
             response.choices[0].message.content, context={"corpus": corpus}
         )
@@ -173,6 +199,7 @@ async def build_requests(
     api_key: str,
     model: str = STAGE_C_SYNTHESIS,
     max_clusters: int = MAX_REQUEST_CLUSTERS,
+    fallback_models: tuple[str, ...] = (STAGE_C_SYNTHESIS_FALLBACK,),
 ) -> list[RequestInsight]:
     """SPEC §3 Block 1 — what the audience is asking the creator to make."""
     candidates = [c for c in comments if stage_b.get(c.id) is not None and stage_b[c.id].is_request]
@@ -181,6 +208,7 @@ async def build_requests(
         draft = await _synthesize(
             cluster, api_key=api_key, model=model,
             system_prompt=REQUEST_SYSTEM_PROMPT, draft_schema=RequestInsightDraft,
+            fallback_models=fallback_models,
         )
         if draft is None:
             continue
@@ -196,6 +224,7 @@ async def build_confusion_points(
     api_key: str,
     model: str = STAGE_C_SYNTHESIS,
     max_clusters: int = MAX_CONFUSION_CLUSTERS,
+    fallback_models: tuple[str, ...] = (STAGE_C_SYNTHESIS_FALLBACK,),
 ) -> list[ConfusionInsight]:
     """SPEC §3 Block 2 — where the creator's explanation didn't land."""
     candidates = [c for c in comments if stage_b.get(c.id) is not None and stage_b[c.id].is_confusion]
@@ -204,6 +233,7 @@ async def build_confusion_points(
         draft = await _synthesize(
             cluster, api_key=api_key, model=model,
             system_prompt=CONFUSION_SYSTEM_PROMPT, draft_schema=ConfusionInsightDraft,
+            fallback_models=fallback_models,
         )
         if draft is None:
             continue
@@ -246,6 +276,7 @@ async def build_video_moods(
     api_key: str,
     model: str = STAGE_C_SYNTHESIS,
     max_videos: int = MAX_UNDERPERFORMING_VIDEOS,
+    fallback_models: tuple[str, ...] = (STAGE_C_SYNTHESIS_FALLBACK,),
 ) -> list[VideoMoodInsight]:
     """SPEC §3 Block 3 — which video underperformed emotionally, and why.
     Only the worst *max_videos* (by delta vs. the channel average, and only
@@ -265,6 +296,7 @@ async def build_video_moods(
         draft = await _synthesize(
             sample, api_key=api_key, model=model,
             system_prompt=DRIVER_SYSTEM_PROMPT, draft_schema=VideoDriverDraft,
+            fallback_models=fallback_models,
         )
         if draft is None:
             continue
@@ -287,9 +319,16 @@ async def build_channel_insights(
     *,
     api_key: str,
     model: str = STAGE_C_SYNTHESIS,
+    fallback_models: tuple[str, ...] = (STAGE_C_SYNTHESIS_FALLBACK,),
 ) -> ChannelInsights:
     """The full SPEC §3 report for one channel analysis."""
-    requests = await build_requests(comments, stage_b, embeddings, api_key=api_key, model=model)
-    confusion_points = await build_confusion_points(comments, stage_b, embeddings, api_key=api_key, model=model)
-    video_moods = await build_video_moods(comments, sentiments, video_titles, api_key=api_key, model=model)
+    requests = await build_requests(
+        comments, stage_b, embeddings, api_key=api_key, model=model, fallback_models=fallback_models,
+    )
+    confusion_points = await build_confusion_points(
+        comments, stage_b, embeddings, api_key=api_key, model=model, fallback_models=fallback_models,
+    )
+    video_moods = await build_video_moods(
+        comments, sentiments, video_titles, api_key=api_key, model=model, fallback_models=fallback_models,
+    )
     return ChannelInsights(requests=requests, confusion_points=confusion_points, video_moods=video_moods)

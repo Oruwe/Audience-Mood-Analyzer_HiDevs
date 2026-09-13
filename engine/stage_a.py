@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import httpx
 
-from config.models import STAGE_A_EMBEDDINGS, STAGE_A_SENTIMENT
+from config.models import STAGE_A_EMBEDDINGS, STAGE_A_SENTIMENT, STAGE_A_SENTIMENT_FALLBACK
 from engine.batching import BatchClassificationFailedError, classify_all_batches
 from resilience import retry_transient
 from schemas import RawComment, StageASentimentBatch, StageASentimentItem
@@ -128,6 +128,7 @@ async def classify_sentiment_batch(
     *,
     api_key: str,
     model: str = STAGE_A_SENTIMENT,
+    fallback_models: tuple[str, ...] = (STAGE_A_SENTIMENT_FALLBACK,),
 ) -> dict[str, StageASentimentItem]:
     """Classify one batch, applying the SPEC §4.1b split-and-retry guard
     (engine.batching — shared with Stage B).
@@ -144,6 +145,7 @@ async def classify_sentiment_batch(
         stage_label="Stage A sentiment",
         batch_size=len(comments) or 1,  # one call for this whole batch, no chunking
         error_cls=SentimentBatchFailedError,
+        fallback_models=fallback_models,
     )
 
 
@@ -153,6 +155,7 @@ async def classify_all_sentiments(
     api_key: str,
     model: str = STAGE_A_SENTIMENT,
     batch_size: int = DEFAULT_SENTIMENT_BATCH_SIZE,
+    fallback_models: tuple[str, ...] = (STAGE_A_SENTIMENT_FALLBACK,),
 ) -> dict[str, StageASentimentItem]:
     """Classify every comment, chunked at *batch_size* per call."""
     return await classify_all_batches(
@@ -164,6 +167,7 @@ async def classify_all_sentiments(
         stage_label="Stage A sentiment",
         batch_size=batch_size,
         error_cls=SentimentBatchFailedError,
+        fallback_models=fallback_models,
     )
 
 

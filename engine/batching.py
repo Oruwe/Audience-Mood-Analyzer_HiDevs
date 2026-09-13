@@ -67,6 +67,34 @@ async def _call_model(model: str, api_key: str, messages: list[dict], response_s
     )
 
 
+async def _call_model_with_fallback(
+    models: tuple[str, ...], api_key: str, messages: list[dict],
+    response_schema: type[BaseModel], *, stage_label: str,
+):
+    """Try *models* in order, each already retried on its own transient
+    errors by `_call_model` -- this only steps to the next model once a
+    given one has exhausted those retries. Added after a live incident
+    (2026-09-13, config/models.py's fallback constants): a free OpenRouter
+    model's 429 can be a *sustained* shared-pool exhaustion, not a
+    momentary blip, and outlasts resilience.py's ~8s retry window. A
+    second free model from a different vendor is unlikely to be exhausted
+    by the same event.
+    """
+    last_exc: Exception | None = None
+    for i, model in enumerate(models):
+        try:
+            return await _call_model(model, api_key, messages, response_schema)
+        except (RateLimitError, ServiceUnavailableError) as exc:
+            last_exc = exc
+            if i + 1 < len(models):
+                logger.warning(
+                    "%s: %s unavailable after retries (%s); falling back to %s",
+                    stage_label, model, exc, models[i + 1],
+                )
+    assert last_exc is not None  # unreachable with a non-empty models tuple
+    raise last_exc
+
+
 async def run_batched_llm_classification(
     comments: list[RawComment],
     *,
@@ -76,6 +104,7 @@ async def run_batched_llm_classification(
     response_schema: type[BaseModel],
     stage_label: str,
     error_cls: type[BatchClassificationFailedError] = BatchClassificationFailedError,
+    fallback_models: tuple[str, ...] = (),
 ) -> dict[str, BaseModel]:
     """Classify one batch, applying the §4.1b split-and-retry guard.
 
@@ -83,6 +112,13 @@ async def run_batched_llm_classification(
     comments — guaranteed by the guard below, never a partial or
     misaligned result. *response_schema* must have a `results: list[Item]`
     field, each `Item` carrying a `comment_id: str`.
+
+    *fallback_models*, if given, are tried in order after *model* has
+    exhausted its own retries on a RateLimitError/ServiceUnavailableError
+    (see `_call_model_with_fallback`) — a free OpenRouter model's shared
+    capacity pool can stay exhausted well past resilience.py's retry
+    window; a different vendor's free model is unlikely to be exhausted by
+    the same event.
     """
     if not comments:
         return {}
@@ -92,7 +128,9 @@ async def run_batched_llm_classification(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": lines},
     ]
-    response = await _call_model(model, api_key, messages, response_schema)
+    response = await _call_model_with_fallback(
+        (model, *fallback_models), api_key, messages, response_schema, stage_label=stage_label,
+    )
     parsed = _parse(response.choices[0].message.content, response_schema)
 
     expected_ids = {c.id for c in comments}
@@ -115,10 +153,12 @@ async def run_batched_llm_classification(
     left = await run_batched_llm_classification(
         comments[:mid], api_key=api_key, model=model, system_prompt=system_prompt,
         response_schema=response_schema, stage_label=stage_label, error_cls=error_cls,
+        fallback_models=fallback_models,
     )
     right = await run_batched_llm_classification(
         comments[mid:], api_key=api_key, model=model, system_prompt=system_prompt,
         response_schema=response_schema, stage_label=stage_label, error_cls=error_cls,
+        fallback_models=fallback_models,
     )
     return {**left, **right}
 
@@ -133,6 +173,7 @@ async def classify_all_batches(
     stage_label: str,
     batch_size: int,
     error_cls: type[BatchClassificationFailedError] = BatchClassificationFailedError,
+    fallback_models: tuple[str, ...] = (),
 ) -> dict[str, BaseModel]:
     """Classify every comment in *comments*, chunked at *batch_size* per call."""
     results: dict[str, BaseModel] = {}
@@ -141,5 +182,6 @@ async def classify_all_batches(
         results.update(await run_batched_llm_classification(
             batch, api_key=api_key, model=model, system_prompt=system_prompt,
             response_schema=response_schema, stage_label=stage_label, error_cls=error_cls,
+            fallback_models=fallback_models,
         ))
     return results

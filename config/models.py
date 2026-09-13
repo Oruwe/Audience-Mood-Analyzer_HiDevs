@@ -60,6 +60,21 @@ for exactly this reason — it's no longer just Stage B's problem.
 # see the module docstring above and SPEC.md §4.1)
 # ---------------------------------------------------------------------------
 
+STAGE_A_SENTIMENT_FALLBACK = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+# Live incident (2026-09-13): STAGE_A_SENTIMENT alone failed a real analysis
+# and the live accuracy benchmark with a genuine, retry-surviving 429 --
+# "google/gemma-4-26b-a4b-it:free is temporarily rate-limited upstream ...
+# limit_source: upstream_provider_shared_pool" -- OpenRouter's free tier
+# shares each model's underlying provider capacity across every OpenRouter
+# user calling it for free, and Stage A is the highest-volume stage (100%
+# of comments, not a filtered subset), so it's the one most likely to hit
+# this. resilience.py's existing retry (4 attempts, backoff to 8s) is for
+# a momentary blip, not a sustained shared-pool exhaustion, and didn't
+# clear it. A different vendor (Nvidia, not Google) was picked as the
+# fallback specifically so a Google-side capacity event doesn't take out
+# both the primary and the fallback at once. engine/batching.py tries this
+# only after the primary has already exhausted its own retries.
+
 STAGE_A_SENTIMENT = "openrouter/google/gemma-4-26b-a4b-it:free"
 # Runs on every comment (not a filtered subset like Stage B/C), so this is
 # the highest-volume call in the whole pipeline — a five-way sentiment
@@ -109,6 +124,12 @@ EMBEDDING_DIM = 1024
 # rather than a declared capability flag. Re-run that eval and swap these
 # strings before this product is trusted with a real creator's channel.
 
+STAGE_B_CLASSIFY_FALLBACK = "openrouter/google/gemma-4-31b-it:free"
+# Same shared-pool-exhaustion risk as STAGE_A_SENTIMENT_FALLBACK above,
+# lower-probability here only because Stage B sees a filtered subset
+# (~10-20% of comments) rather than 100% of them. Different vendor
+# (Google) from the primary (MiniMax) for the same reason.
+
 STAGE_B_CLASSIFY = "openrouter/minimax/minimax-m2.7:free"
 # Role: batched classification of the Stage-A-flagged subset (~10-20% of
 # comments, 40-60 per call) — intent / is_request / is_confusion. Picked
@@ -118,6 +139,13 @@ STAGE_B_CLASSIFY = "openrouter/minimax/minimax-m2.7:free"
 # "pick Stage B on schema reliability and cost" criterion (SPEC §11), with
 # cost now fixed at $0 across the whole free set and reliability the only
 # remaining axis to differentiate on.
+
+STAGE_C_SYNTHESIS_FALLBACK = "openrouter/minimax/minimax-m3:free"
+# Same shared-pool-exhaustion risk, lowest-probability of the three
+# generative stages (only ~8 calls total) but still worth covering: a
+# single unfallback-able failure here fails the whole report at the very
+# last stage, after every other stage already succeeded. Different vendor
+# (MiniMax) from the primary (Z-AI/GLM).
 
 STAGE_C_SYNTHESIS = "openrouter/z-ai/glm-5.2:free"
 # Role: one call per cluster (capped at 8) producing an insight block and

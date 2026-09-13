@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from litellm.exceptions import AuthenticationError, ServiceUnavailableError
+from litellm.exceptions import AuthenticationError, RateLimitError, ServiceUnavailableError
 
 import engine.batching as batching
 import engine.insights as insights
@@ -112,6 +112,81 @@ def test_embeddings_does_not_retry_a_401():
     with pytest.raises(stage_a.EmbeddingAPIError):
         asyncio.run(scenario())
     assert calls["count"] == 1
+
+
+def test_batching_falls_back_to_a_different_model_once_the_primary_is_exhausted(monkeypatch):
+    """Live incident (2026-09-13, config/models.py's *_FALLBACK constants):
+    a free OpenRouter model's 429 can be a sustained shared-pool
+    exhaustion that outlasts resilience.py's own retry window -- this is
+    the actual fix, not just the retry covered above."""
+    comments = [_comment(0)]
+    valid_json = json.dumps({
+        "results": [{"comment_id": "c0", "sentiment": "positive", "confidence": 0.9}]
+    })
+    calls = {"model-a": 0, "model-b": 0}
+
+    async def fake_acompletion(*, model, **kwargs):
+        calls[model] += 1
+        if model == "model-a":
+            raise RateLimitError(message="rate limited", model=model, llm_provider="openrouter")
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=valid_json))]
+        )
+
+    monkeypatch.setattr(batching, "acompletion", fake_acompletion)
+    result = asyncio.run(batching.run_batched_llm_classification(
+        comments, api_key=API_KEY, model="model-a", system_prompt="sys",
+        response_schema=StageASentimentBatch, stage_label="test",
+        fallback_models=("model-b",),
+    ))
+
+    assert calls["model-a"] == 4  # exhausted every retry before giving up on it
+    assert calls["model-b"] == 1
+    assert result["c0"].sentiment.value == "positive"
+
+
+def test_batching_raises_when_every_model_including_fallbacks_is_exhausted(monkeypatch):
+    comments = [_comment(0)]
+
+    async def always_rate_limited(*, model, **kwargs):
+        raise RateLimitError(message="rate limited", model=model, llm_provider="openrouter")
+
+    monkeypatch.setattr(batching, "acompletion", always_rate_limited)
+
+    with pytest.raises(RateLimitError):
+        asyncio.run(batching.run_batched_llm_classification(
+            comments, api_key=API_KEY, model="model-a", system_prompt="sys",
+            response_schema=StageASentimentBatch, stage_label="test",
+            fallback_models=("model-b",),
+        ))
+
+
+def test_insights_stage_c_falls_back_to_a_different_model_once_the_primary_is_exhausted(monkeypatch):
+    valid_json = json.dumps({
+        "theme": "Wants a Docker follow-up",
+        "quotes": ["a real quote", "another real quote"],
+        "suggested_title": "Docker 101",
+    })
+    calls = {"model-a": 0, "model-b": 0}
+
+    async def fake_acompletion(*, model, **kwargs):
+        calls[model] += 1
+        if model == "model-a":
+            raise RateLimitError(message="rate limited", model=model, llm_provider="openrouter")
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=valid_json))]
+        )
+
+    monkeypatch.setattr(insights, "acompletion", fake_acompletion)
+    from schemas import RequestInsightDraft
+
+    result = asyncio.run(insights._call_stage_c_with_fallback(
+        ("model-a", "model-b"), API_KEY, [{"role": "user", "content": "hi"}], RequestInsightDraft,
+    ))
+
+    assert calls["model-a"] == 4
+    assert calls["model-b"] == 1
+    assert result.choices[0].message.content == valid_json
 
 
 def test_insights_stage_c_retries_a_transient_litellm_error(monkeypatch):
