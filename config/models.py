@@ -54,8 +54,17 @@ each; a full analysis costs well under a cent), on four *different*
 vendors so no single provider's capacity event can stall more than one
 stage.
 
-The *_FALLBACK constants stay on free models on purpose: they are
-insurance against a genuine outage of a paid primary, not the normal path.
+The *_FALLBACK constants were initially left on free models, on the
+reasoning that insurance only pays out rarely so its rate limits cost
+nothing. That was wrong for one specific reason: insurance is only
+insurance if it answers when called, and the same day's logs show the
+free pool 429ing on *nearly every* request. A free fallback therefore
+routes a failing paid primary straight back into the fire, at exactly the
+moment reliability matters most. All three fallbacks are now paid too, on
+a different vendor from their own primary AND from each other — so no
+single provider event can take out two stages' insurance at once. The
+added cost is genuinely ~nil: fallbacks only run when a primary has
+already failed.
 
 --- Why not the local encoder SPEC §4.1 originally specified? (2026-09-13) ---
 Asked directly, and worth recording since every failure above is exactly
@@ -101,12 +110,11 @@ for exactly this reason — it's no longer just Stage B's problem.
 # see the module docstring above and SPEC.md §4.1)
 # ---------------------------------------------------------------------------
 
-STAGE_A_SENTIMENT_FALLBACK = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
-# Originally the safety net for a free STAGE_A_SENTIMENT primary; kept as
-# cheap ($0) insurance now that the primary is paid (see below) -- covers
-# a genuine OpenRouter/provider-wide outage on the primary, which
-# resilience.is_fallback_worthy_api_error still routes here immediately
-# (no wasted retry) on a RateLimitError or 404.
+STAGE_A_SENTIMENT_FALLBACK = "openrouter/meta-llama/llama-3.1-8b-instruct"
+# Paid, for the reason recorded in the module docstring's "insurance that
+# routes back into the fire" note: a free fallback is only insurance if
+# it answers when called, and the free pool demonstrably does not.
+# $0.050/$0.080 per M. Different vendor (Meta) from the primary (Mistral).
 
 STAGE_A_SENTIMENT = "openrouter/mistralai/mistral-nemo"
 # Runs on every comment (not a filtered subset like Stage B/C), so this is
@@ -159,14 +167,11 @@ EMBEDDING_DIM = 1024
 # rather than a declared capability flag. Re-run that eval and swap these
 # strings before this product is trusted with a real creator's channel.
 
-STAGE_B_CLASSIFY_FALLBACK = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
-# Different vendor (Nvidia) from the new primary (Google) for the same
-# shared-pool-exhaustion reasoning as the other stages' fallbacks.
-# Overlaps with STAGE_A_SENTIMENT_FALLBACK (same model, different role) --
-# acceptable: it's a backup here, not a primary, and the alternative was
-# guessing at a third free slug with zero data behind the guess. Swap for
-# something else once one of these two stages actually needs it live and
-# a genuinely distinct pick can be chosen with real evidence.
+STAGE_B_CLASSIFY_FALLBACK = "openrouter/openai/gpt-oss-20b"
+# Paid, same reasoning as STAGE_A_SENTIMENT_FALLBACK. $0.030/$0.130 per M.
+# Different vendor (OpenAI) from the primary (Qwen), and no longer shared
+# with Stage A's fallback -- every stage now has a distinct backup, so no
+# single provider event can take out two stages' insurance at once.
 
 STAGE_B_CLASSIFY = "openrouter/qwen/qwen3.7-flash"
 # Role: batched classification of the Stage-A-flagged subset (~10-20% of
@@ -184,12 +189,12 @@ STAGE_B_CLASSIFY = "openrouter/qwen/qwen3.7-flash"
 # supports_response_schema. Different vendor (Qwen) from Stage A's Mistral,
 # so one provider's capacity event can't stall both stages at once.
 
-STAGE_C_SYNTHESIS_FALLBACK = "openrouter/minimax/minimax-m3:free"
-# Same shared-pool-exhaustion risk, lowest-probability of the three
-# generative stages (only ~8 calls total) but still worth covering: a
-# single unfallback-able failure here fails the whole report at the very
-# last stage, after every other stage already succeeded. Different vendor
-# (MiniMax) from the primary (Z-AI/GLM).
+STAGE_C_SYNTHESIS_FALLBACK = "openrouter/google/gemma-4-26b-a4b-it"
+# Paid, same reasoning as the other two fallbacks. $0.042/$0.220 per M --
+# the most capable of the three backups, deliberately: Stage C is the only
+# stage whose output a human reads, and a failure here wastes every
+# earlier stage's work. Different vendor (Google) from the primary
+# (DeepSeek).
 
 STAGE_C_SYNTHESIS = "openrouter/deepseek/deepseek-v4-flash-0731"
 # Role: one call per cluster (capped at 8) producing an insight block and
