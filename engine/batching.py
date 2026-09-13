@@ -19,18 +19,11 @@ from __future__ import annotations
 
 import logging
 
+import openai
 from litellm import acompletion
-from litellm.exceptions import (
-    APIConnectionError,
-    BadGatewayError,
-    InternalServerError,
-    RateLimitError,
-    ServiceUnavailableError,
-    Timeout,
-)
 from pydantic import BaseModel, ValidationError
 
-from resilience import retry_transient
+from resilience import is_retryable_api_error, retry_transient_api_error
 from schemas import RawComment
 
 logger = logging.getLogger(__name__)
@@ -51,12 +44,10 @@ def _parse(raw_content: str, response_schema: type[BaseModel]) -> BaseModel | No
 
 
 # SPEC §8: "Retries: tenacity, exponential backoff + jitter, on ... OpenRouter
-# calls." Only these -- a genuine bad request, auth failure, or content-policy
-# rejection must fail immediately, not retry into a slower failure.
-@retry_transient(
-    RateLimitError, ServiceUnavailableError, Timeout,
-    APIConnectionError, InternalServerError, BadGatewayError,
-)
+# calls." resilience.is_retryable_api_error excludes a genuine bad request,
+# auth failure, or content-policy rejection -- those fail immediately,
+# never retried into a slower failure.
+@retry_transient_api_error()
 async def _call_model(model: str, api_key: str, messages: list[dict], response_schema: type[BaseModel]):
     return await acompletion(
         model=model,
@@ -84,7 +75,9 @@ async def _call_model_with_fallback(
     for i, model in enumerate(models):
         try:
             return await _call_model(model, api_key, messages, response_schema)
-        except (RateLimitError, ServiceUnavailableError) as exc:
+        except openai.APIError as exc:
+            if not is_retryable_api_error(exc):
+                raise
             last_exc = exc
             if i + 1 < len(models):
                 logger.warning(
@@ -114,11 +107,11 @@ async def run_batched_llm_classification(
     field, each `Item` carrying a `comment_id: str`.
 
     *fallback_models*, if given, are tried in order after *model* has
-    exhausted its own retries on a RateLimitError/ServiceUnavailableError
-    (see `_call_model_with_fallback`) — a free OpenRouter model's shared
-    capacity pool can stay exhausted well past resilience.py's retry
-    window; a different vendor's free model is unlikely to be exhausted by
-    the same event.
+    exhausted its own retries on any transient error (see
+    `_call_model_with_fallback`/`resilience.is_retryable_api_error`) — a
+    free OpenRouter model's shared capacity pool can stay exhausted well
+    past resilience.py's retry window; a different vendor's free model is
+    unlikely to be exhausted by the same event.
     """
     if not comments:
         return {}

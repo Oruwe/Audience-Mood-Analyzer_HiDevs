@@ -27,20 +27,13 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+import openai
 from litellm import acompletion
-from litellm.exceptions import (
-    APIConnectionError,
-    BadGatewayError,
-    InternalServerError,
-    RateLimitError,
-    ServiceUnavailableError,
-    Timeout,
-)
 from pydantic import BaseModel, ValidationError
 from sklearn.cluster import KMeans
 
 from config.models import STAGE_C_SYNTHESIS, STAGE_C_SYNTHESIS_FALLBACK
-from resilience import retry_transient
+from resilience import is_retryable_api_error, retry_transient_api_error
 from schemas import (
     ChannelInsights,
     ConfusionInsight,
@@ -102,10 +95,7 @@ DRIVER_SYSTEM_PROMPT = (
 )
 
 
-@retry_transient(
-    RateLimitError, ServiceUnavailableError, Timeout,
-    APIConnectionError, InternalServerError, BadGatewayError,
-)
+@retry_transient_api_error()
 async def _call_stage_c(model: str, api_key: str, messages: list[dict], response_schema: type[BaseModel]):
     return await acompletion(
         model=model, api_key=api_key, messages=messages,
@@ -117,15 +107,19 @@ async def _call_stage_c_with_fallback(
     models: tuple[str, ...], api_key: str, messages: list[dict], response_schema: type[BaseModel],
 ):
     """Same reasoning as engine.batching._call_model_with_fallback: a free
-    OpenRouter model's 429 can outlast _call_stage_c's own retries (a
-    sustained shared-pool exhaustion, not a momentary blip) -- try the next
-    model, from a different vendor, before giving up on this cluster.
+    OpenRouter model's transient failure -- a 429, or (live incident,
+    2026-09-13) an "Nvidia: Service temporarily overloaded" surfaced as a
+    bare litellm.APIError -- can outlast _call_stage_c's own retries; try
+    the next model, from a different vendor, before giving up on this
+    cluster.
     """
     last_exc: Exception | None = None
     for i, model in enumerate(models):
         try:
             return await _call_stage_c(model, api_key, messages, response_schema)
-        except (RateLimitError, ServiceUnavailableError) as exc:
+        except openai.APIError as exc:
+            if not is_retryable_api_error(exc):
+                raise
             last_exc = exc
             if i + 1 < len(models):
                 logger.warning(

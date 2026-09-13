@@ -9,8 +9,16 @@ those call sites' real backoff timing.
 import asyncio
 
 import pytest
+from litellm.exceptions import (
+    APIError,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    RateLimitError,
+    ServiceUnavailableError,
+)
 
-from resilience import retry_transient
+from resilience import is_retryable_api_error, retry_transient, retry_transient_api_error
 
 
 class _Boom(Exception):
@@ -79,3 +87,61 @@ def test_works_on_sync_functions_too():
 
     assert flaky_sync() == "ok"
     assert calls["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# is_retryable_api_error / retry_transient_api_error -- a deny-list, not an
+# allow-list, after a live incident where a real transient OpenRouter
+# failure ("Nvidia: Service temporarily overloaded") surfaced from litellm
+# as the bare base APIError rather than one of the more specific
+# subclasses this project used to retry on by name.
+# ---------------------------------------------------------------------------
+
+def _api_error(cls=APIError):
+    # Every litellm exception subclass takes message/llm_provider/model;
+    # only the bare APIError additionally requires status_code.
+    kwargs = dict(message="boom", llm_provider="openrouter", model="m")
+    if cls is APIError:
+        kwargs["status_code"] = 500
+    return cls(**kwargs)
+
+
+@pytest.mark.parametrize("cls", [APIError, RateLimitError, ServiceUnavailableError])
+def test_is_retryable_api_error_true_for_transient_types(cls):
+    assert is_retryable_api_error(_api_error(cls)) is True
+
+
+@pytest.mark.parametrize("cls", [AuthenticationError, BadRequestError, NotFoundError])
+def test_is_retryable_api_error_false_for_permanent_client_errors(cls):
+    assert is_retryable_api_error(_api_error(cls)) is False
+
+
+def test_is_retryable_api_error_false_for_a_non_api_error():
+    assert is_retryable_api_error(ValueError("not even an APIError")) is False
+
+
+def test_retry_transient_api_error_retries_a_bare_api_error():
+    calls = {"count": 0}
+
+    @retry_transient_api_error(max_attempts=4, wait_multiplier=0.001, wait_max=0.01)
+    async def flaky():
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise _api_error()
+        return "ok"
+
+    assert asyncio.run(flaky()) == "ok"
+    assert calls["count"] == 3
+
+
+def test_retry_transient_api_error_does_not_retry_authentication_error():
+    calls = {"count": 0}
+
+    @retry_transient_api_error(max_attempts=4, wait_multiplier=0.001, wait_max=0.01)
+    async def always_bad_key():
+        calls["count"] += 1
+        raise _api_error(AuthenticationError)
+
+    with pytest.raises(AuthenticationError):
+        asyncio.run(always_bad_key())
+    assert calls["count"] == 1

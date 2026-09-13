@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from litellm.exceptions import AuthenticationError, RateLimitError, ServiceUnavailableError
+from litellm.exceptions import APIError, AuthenticationError, RateLimitError, ServiceUnavailableError
 
 import engine.batching as batching
 import engine.insights as insights
@@ -112,6 +112,67 @@ def test_embeddings_does_not_retry_a_401():
     with pytest.raises(stage_a.EmbeddingAPIError):
         asyncio.run(scenario())
     assert calls["count"] == 1
+
+
+def _bare_api_error(model: str) -> APIError:
+    """Live incident (2026-09-13): a real "Nvidia: Service temporarily
+    overloaded" failure surfaced from litellm as the bare base APIError,
+    not one of the more specific subclasses (ServiceUnavailableError etc.)
+    this project used to retry on by name -- OpenRouter doesn't always wrap
+    a transient upstream failure into a specific subclass."""
+    return APIError(status_code=500, message="Service temporarily overloaded",
+                     llm_provider="openrouter", model=model)
+
+
+def test_batching_retries_a_bare_api_error_not_just_named_subclasses(monkeypatch):
+    comments = [_comment(0)]
+    valid_json = json.dumps({
+        "results": [{"comment_id": "c0", "sentiment": "positive", "confidence": 0.9}]
+    })
+    calls = {"count": 0}
+
+    async def flaky_acompletion(*, model, **kwargs):
+        calls["count"] += 1
+        if calls["count"] < 2:
+            raise _bare_api_error(model)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=valid_json))]
+        )
+
+    monkeypatch.setattr(batching, "acompletion", flaky_acompletion)
+    result = asyncio.run(batching.run_batched_llm_classification(
+        comments, api_key=API_KEY, model="openrouter/x", system_prompt="sys",
+        response_schema=StageASentimentBatch, stage_label="test",
+    ))
+
+    assert calls["count"] == 2
+    assert result["c0"].sentiment.value == "positive"
+
+
+def test_batching_falls_back_on_a_bare_api_error_from_the_primary(monkeypatch):
+    calls = {"model-a": 0, "model-b": 0}
+    valid_json = json.dumps({
+        "results": [{"comment_id": "c0", "sentiment": "positive", "confidence": 0.9}]
+    })
+
+    async def fake_acompletion(*, model, **kwargs):
+        calls[model] += 1
+        if model == "model-a":
+            raise _bare_api_error(model)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=valid_json))]
+        )
+
+    monkeypatch.setattr(batching, "acompletion", fake_acompletion)
+    result = asyncio.run(batching.run_batched_llm_classification(
+        [_comment(0)], api_key=API_KEY, model="model-a", system_prompt="sys",
+        response_schema=StageASentimentBatch, stage_label="test",
+        fallback_models=("model-b",),
+    ))
+
+    assert calls["model-a"] == 4  # exhausted every retry before falling back
+    assert calls["model-b"] == 1
+    assert result["c0"].sentiment.value == "positive"
 
 
 def test_batching_falls_back_to_a_different_model_once_the_primary_is_exhausted(monkeypatch):
