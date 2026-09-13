@@ -8,7 +8,6 @@ python-dotenv
 websockets>=12.0
 
 # Storage & Observability
-duckdb
 pytz>=2024.1
 langfuse
 
@@ -20,7 +19,8 @@ numpy>=2.1
 scipy>=1.14
 scikit-learn>=1.5
 
-# V2 API layer
-fastapi>=0.115
-uvicorn[standard]>=0.30
+# HTTP
 httpx>=0.27
+
+# Testing (SPEC.md §11 test harness)
+pytest
