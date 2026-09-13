@@ -95,6 +95,18 @@ class TransientEmbeddingError(EmbeddingAPIError):
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 
+def _openrouter_model_id(model: str) -> str:
+    """config.models strings carry litellm's `openrouter/` routing prefix
+    (needed by classify_sentiment_batch's litellm.acompletion call) — but
+    this function talks to OpenRouter's REST API directly, which uses its
+    own bare `vendor/model` ids and has never heard of that prefix.
+    Sending it verbatim gets a very literal "Model openrouter/vendor/model
+    does not exist" (confirmed against the real API — this bug shipped
+    once already). Strip it here, in the one call site that needs to.
+    """
+    return model.removeprefix("openrouter/")
+
+
 @retry_transient(TransientEmbeddingError, httpx.TransportError, httpx.TimeoutException)
 async def _post_embeddings(
     client: httpx.AsyncClient, api_key: str, model: str, texts: list[str]
@@ -102,7 +114,7 @@ async def _post_embeddings(
     response = await client.post(
         OPENROUTER_EMBEDDINGS_URL,
         headers={"Authorization": f"Bearer {api_key}"},
-        json={"model": model, "input": texts},
+        json={"model": _openrouter_model_id(model), "input": texts},
     )
     if response.status_code in _RETRYABLE_STATUS:
         raise TransientEmbeddingError(response.status_code, response.text)

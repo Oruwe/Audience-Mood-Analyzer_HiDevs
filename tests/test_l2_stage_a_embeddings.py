@@ -131,3 +131,51 @@ def test_request_uses_bearer_auth_header_not_a_query_param():
 
     asyncio.run(scenario())
     assert captured["auth"] == f"Bearer {API_KEY}"
+
+
+def test_the_openrouter_routing_prefix_is_stripped_before_the_real_request():
+    """Shipped as a real bug once already: config.models' STAGE_A_EMBEDDINGS
+    carries litellm's `openrouter/` routing prefix (needed by the sentiment
+    call, which goes through litellm), but this function talks to
+    OpenRouter's REST API directly -- sending that prefix verbatim got a
+    live "Model openrouter/vendor/... does not exist" from the real API.
+    Uses a made-up model string (not the real configured one) so this test
+    doesn't itself trip the single-config-boundary rule.
+    """
+    comments = [_comment(0)]
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+        captured["model"] = json.loads(request.content)["model"]
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [1.0]}]})
+
+    async def scenario():
+        async with _client(handler) as client:
+            await stage_a.embed_comments_batch(
+                comments, client=client, api_key=API_KEY,
+                model="openrouter/some-vendor/some-embedding-model",
+            )
+
+    asyncio.run(scenario())
+    assert captured["model"] == "some-vendor/some-embedding-model"
+
+
+def test_a_model_id_without_the_prefix_is_left_untouched():
+    comments = [_comment(0)]
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+        captured["model"] = json.loads(request.content)["model"]
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [1.0]}]})
+
+    async def scenario():
+        async with _client(handler) as client:
+            await stage_a.embed_comments_batch(
+                comments, client=client, api_key=API_KEY,
+                model="some-vendor/some-embedding-model",
+            )
+
+    asyncio.run(scenario())
+    assert captured["model"] == "some-vendor/some-embedding-model"

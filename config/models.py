@@ -14,6 +14,25 @@ don't fit this build's schedule; all three model picks below are reasoned,
 not measured, and are flagged for the real §11 L4 schema-validity eval
 before this product is trusted with a real creator's channel.
 
+--- All four stages moved to OpenRouter ":free" endpoints (2026-09-13) ---
+This build's operator explicitly requested every stage — Stage A sentiment,
+Stage A embeddings, Stage B, and Stage C — run on a free OpenRouter tier,
+reversing the "Rejected: :free endpoints" call this file made earlier the
+same day. That earlier rejection's reasoning still holds as a real
+tradeoff, not a mistake: free endpoints carry lower, sometimes-changing
+rate limits that can collide with SPEC §8's checkpointed batch job, and
+§11's own selection metric (schema-validity rate under batch load) is
+exactly what a throttled endpoint is likeliest to fail. The operator was
+told this and chose free anyway — the priority here is $0 spend over
+throughput/reliability margin, which this codebase is already positioned
+to absorb better than most: engine/batching.py's split-and-retry guard and
+resilience.py's tenacity-backed retry_transient both exist specifically to
+turn a transient failure (a 429 included) into a slower success instead of
+a crash. If real usage shows free-tier throttling making analyses too slow
+or too failure-prone, the fix is a one-line swap back to a paid string
+here — same "bake-off is a two-line edit" property this file was already
+designed around.
+
 --- Stage A architecture deviation from SPEC.md §4.1 (recorded 2026-09-13) ---
 SPEC §4.1 locks Stage A to a local, free, deterministic encoder, for four
 explicit reasons: cost (runs on 100% of comments), determinism (testable —
@@ -41,33 +60,37 @@ for exactly this reason — it's no longer just Stage B's problem.
 # see the module docstring above and SPEC.md §4.1)
 # ---------------------------------------------------------------------------
 
-STAGE_A_SENTIMENT = "openrouter/qwen/qwen3.7-flash"
-# Runs on every comment (not a filtered subset like Stage B/C), so cost and
-# throughput dominate the pick over raw quality — this is a five-way
-# sentiment label, about the easiest task an LLM can be asked to do.
-# Cheapest non-free, declared-structured-output model found in the same
-# litellm-cost-map survey used for Stage B/C (config/models.py's prior
-# revision): ~$0.03 / $0.13 per M input/output tokens, cheaper than
-# STAGE_B_CLASSIFY. ":free" tier endpoints were rejected for the same
-# reason as Stage B/C: rate limits that fight a checkpointed batch job
-# (SPEC §8) and are likeliest to fail exactly the metric SPEC §11 says to
-# measure (schema-validity rate under batch load).
+STAGE_A_SENTIMENT = "openrouter/google/gemma-4-26b-a4b-it:free"
+# Runs on every comment (not a filtered subset like Stage B/C), so this is
+# the highest-volume call in the whole pipeline — a five-way sentiment
+# label, about the easiest task an LLM can be asked to do. Picked from
+# litellm's maintained cost map (github.com/BerriAI/litellm), filtered to
+# `openrouter/*` chat models tagged `:free` with `supports_response_schema:
+# true` (2026-09-13 pull) — a Mixture-of-Experts model with only ~4B active
+# params per token, the closest thing in the free set to matching this
+# stage's "cheapest/fastest that can still hit the schema" old criterion.
 
-STAGE_A_EMBEDDINGS = "openrouter/qwen/qwen3-embedding-0.6b"
+STAGE_A_EMBEDDINGS = "openrouter/liquid/lfm-2.5-embedding-350m:free"
 EMBEDDING_DIM = 1024
-# OpenRouter added a dedicated, OpenAI-compatible /embeddings endpoint
-# (confirmed via web search — this postdates litellm's cost map, which has
-# zero openrouter/* embedding-mode entries as of the 2026-09-13 pull used
-# for Stage B/C, so engine/stage_a.py calls this endpoint directly over
-# httpx rather than through litellm). Picked the smallest/cheapest member
-# of the Qwen3-Embedding family (~$0.01/M tokens, cheapest embedding option
-# found) in the same "start small" spirit as the original local e5-small
-# pick — this now matters for cost/latency instead of RAM, but the
-# principle is the same: upgrading to the 4B/8B variant later is a
-# one-line change plus a re-embed. EMBEDDING_DIM=1024 is the model's
-# documented native output size — NOT yet confirmed against a live API
-# response (openrouter.ai is unreachable from this build sandbox); verify
-# with one real call before trusting downstream clustering math.
+# litellm's cost map has zero openrouter/* embedding-mode entries at any
+# price (confirmed against a fresh 2026-09-13 pull), so unlike the other
+# three stages this pick could not be sourced or cross-checked from that
+# registry — it's confirmed only via openrouter.ai's own model page
+# (openrouter.ai/liquid/lfm-2.5-embedding-350m:free; openrouter.ai is
+# unreachable from this build sandbox, so this is a web-search result, not
+# a call this build has made itself). Chosen because it's the one free
+# OpenRouter embedding model that documents 1,024-dimension output,
+# matching EMBEDDING_DIM without a re-derivation — but that dimension, and
+# the model's existence/behavior at all, is UNVERIFIED against a live API
+# response from this build. The model page also documents a 512-token
+# input cap per text, well under this stage's per-comment inputs in
+# practice but unenforced here — a comment longer than that may be
+# silently truncated by the provider rather than rejected; SPEC §11's
+# real eval pass should check this before this product is trusted with a
+# real creator's channel. The previously-configured paid alternative
+# (qwen/qwen3-embedding-0.6b, ~$0.01/M tokens) was already negligible cost
+# and is not the reason this changed — it changed because the operator
+# asked for $0 spend on every stage, embeddings included.
 
 # ---------------------------------------------------------------------------
 # Stage B / C — OpenRouter, generative (SPEC §4.1, §7, §11)
@@ -76,36 +99,43 @@ EMBEDDING_DIM = 1024
 # Picks below skip the live §11 bake-off (§11.1 explicitly allows this) and
 # are instead reasoned from litellm's maintained cost/capability map
 # (github.com/BerriAI/litellm — already a repo dependency), pulled
-# 2026-09-13, filtered to `openrouter/*` chat models declaring
-# `supports_response_schema: true`. openrouter.ai itself is unreachable from
-# this build sandbox (network egress policy), so this is the closest
-# available substitute for browsing openrouter.ai/models directly — it is
-# NOT a substitute for the real §11 L4 schema-validity eval, which measures
-# actual per-provider constrained-decoding behavior rather than a declared
-# capability flag. Re-run that eval and swap these two strings before this
-# product is trusted with a real creator's channel.
+# 2026-09-13, filtered to `openrouter/*` chat models tagged `:free` and
+# declaring `supports_response_schema: true`. openrouter.ai itself is
+# unreachable from this build sandbox (network egress policy), so this is
+# the closest available substitute for browsing openrouter.ai/models
+# directly — it is NOT a substitute for the real §11 L4 schema-validity
+# eval, which measures actual per-provider constrained-decoding behavior
+# (and, for the free tier specifically, throughput under rate limits)
+# rather than a declared capability flag. Re-run that eval and swap these
+# strings before this product is trusted with a real creator's channel.
 
-STAGE_B_CLASSIFY = "openrouter/deepseek/deepseek-v4-flash"
+STAGE_B_CLASSIFY = "openrouter/minimax/minimax-m2.7:free"
 # Role: batched classification of the Stage-A-flagged subset (~10-20% of
-# comments, 40-60 per call) — intent / is_request / is_confusion. Cheapest
-# model in the filtered set (~$0.085 / $0.171 per M input/output tokens)
-# with a 1,048,576-token context, comfortably oversized for a 60-comment
-# batch. DeepSeek's structured-JSON output is well regarded in practice,
-# which is the property this stage actually needs (SPEC §11: "pick Stage B
-# on schema reliability and cost").
+# comments, 40-60 per call) — intent / is_request / is_confusion. Picked
+# from the free+schema-capable set on context headroom (196,608 tokens,
+# comfortably oversized for a 60-comment batch) and general standing as a
+# mid-size, instruction-tuned model — the free-tier analogue of the old
+# "pick Stage B on schema reliability and cost" criterion (SPEC §11), with
+# cost now fixed at $0 across the whole free set and reliability the only
+# remaining axis to differentiate on.
 
-STAGE_C_SYNTHESIS = "openrouter/qwen/qwen3-max"
+STAGE_C_SYNTHESIS = "openrouter/z-ai/glm-5.2:free"
 # Role: one call per cluster (capped at 8) producing an insight block and
-# selecting verbatim quotes. At ~8 calls per analysis, price is noise
-# ($0.78 / $3.90 per M) so this is picked on capability, not cost (SPEC
-# §11: "pick Stage C on quality"). Qwen's flagship non-thinking model:
-# strong general reasoning, well-regarded multilingual/code-switching
-# handling — relevant given the Hinglish comment base SPEC §4.1 calls out
-# — and 262,144-token context, well beyond one cluster's worth of comments
-# plus schema.
+# selecting verbatim quotes. At ~8 calls per analysis this was previously
+# picked on capability alone since price was noise (SPEC §11: "pick Stage C
+# on quality") — with cost now fixed at $0 across the whole free set,
+# that same "pick on capability" logic points at GLM's flagship free
+# entry: it's the frontier-class model in the free+schema-capable set
+# (openrouter/openrouter/auto and openrouter/openrouter/free were also
+# available but were rejected here — they're OpenRouter's own dynamic
+# meta-routers, not a pinned model, which would silently reintroduce the
+# non-determinism this project already gave up once for Stage A; a fixed
+# string keeps this stage swappable-and-testable the same way as the
+# other three). 256,000-token context, well beyond one cluster's worth of
+# comments plus schema.
 #
-# Rejected: OpenRouter ":free" endpoints (e.g. z-ai/glm-5.2:free) for any
-# of the three stages above. Free tiers carry rate limits that fight the
-# checkpointed batch job in SPEC §8, and §11's own selection metric —
-# schema-validity rate under batch load — is exactly what a throttled free
-# endpoint is likeliest to fail.
+# All three generative stages above (and Stage A embeddings, sourced
+# separately — see its own comment) are free-tier, per the operator's
+# explicit "use a free model" request covering every stage. See this
+# file's module docstring for the accepted-tradeoff record on that
+# decision.
