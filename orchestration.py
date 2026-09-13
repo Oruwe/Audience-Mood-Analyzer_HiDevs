@@ -76,6 +76,7 @@ from storage.postgres import (
     is_cancel_requested,
     record_batch_result,
     request_cancellation,
+    set_total_comment_count,
     update_job_progress,
 )
 
@@ -258,6 +259,11 @@ async def analyze_channel(
                 conn, job_id, estimate, client=client, youtube_api_key=youtube_api_key,
                 ledger=ledger, dedup=dedup,
             )
+            # SPEC §4.2 cache key's other half (channel_ref is set at
+            # create_job time) -- lets a later analysis of this channel at
+            # the same comment count find and reuse this job instead of
+            # spending quota again (storage.postgres.find_reusable_job).
+            await set_total_comment_count(conn, job_id, len(comments))
 
             await _check_cancel(conn, job_id)
             await update_job_progress(

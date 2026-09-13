@@ -308,3 +308,42 @@ def test_start_analysis_and_cancel_analysis_wire_through(monkeypatch, pg_dsn):
     progress = _run(scenario())
     assert progress.status == "pending"  # background thread never actually ran
     assert progress.cancel_requested is True
+
+
+def test_analyze_channel_records_total_comment_count_for_the_spec_4_2_cache(monkeypatch, pg_dsn):
+    """SPEC §4.2: "cache by video, not by request... if the comment count
+    hasn't moved, serve the cached analysis." Confirms analyze_channel sets
+    the count find_reusable_job later looks up by."""
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    calls: dict = {}
+    _install_happy_path_mocks(monkeypatch, video_specs=[("v1", 2), ("v2", 3)], calls=calls)
+
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            from storage.postgres import create_job, find_reusable_job
+            job_id = await create_job(conn, "chan-for-cache-test")
+        finally:
+            await conn.close()
+
+        # _run_claimed_job (not analyze_channel directly) so the job
+        # actually lands on 'completed' -- find_reusable_job only matches
+        # completed jobs.
+        await orchestration._run_claimed_job(
+            job_id, "chan-for-cache-test", youtube_api_key="yt-key", openrouter_api_key="or-key",
+        )
+
+        conn2 = await asyncpg.connect(pg_dsn)
+        try:
+            progress = await get_job_progress(conn2, job_id)
+            found = await find_reusable_job(conn2, "chan-for-cache-test", 5)
+            not_found = await find_reusable_job(conn2, "chan-for-cache-test", 999)
+            return progress, found, not_found, job_id
+        finally:
+            await conn2.close()
+
+    progress, found, not_found, job_id = _run(scenario())
+    assert progress.total_comment_count == 5  # 2 + 3 comments across the two videos
+    assert found == job_id
+    assert not_found is None
