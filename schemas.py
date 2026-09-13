@@ -41,6 +41,11 @@ class RawComment(BaseModel):
     author_handle: str | None = None  # e.g. "@maya_builds" (handle-style platforms)
     author_id: str | None = None      # e.g. DID / stable account identifier
     timestamp: datetime
+    # --- SPEC §2 "schemas.py — keep, extend" additions for ingestion/youtube.py ---
+    video_id: str | None = None       # which video this comment belongs to —
+                                       # required for the §3 Block 3 "mood by video" grouping
+    like_count: int = 0               # free in the same API response; a cheap salience signal
+    is_reply: bool = False            # top-level comment vs. a reply under it
 
 
 class DeepMoodAnalysis(BaseModel):
