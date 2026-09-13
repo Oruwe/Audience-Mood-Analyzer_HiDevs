@@ -37,20 +37,25 @@ JobStatus = Literal["pending", "running", "completed", "failed", "cancelled"]
 
 _SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS analysis_jobs (
-    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    channel_ref      TEXT NOT NULL,
-    status           TEXT NOT NULL DEFAULT 'pending',
-    stage            TEXT,
-    total_units      INTEGER,
-    completed_units  INTEGER NOT NULL DEFAULT 0,
-    cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
-    error            TEXT,
-    claimed_at       TIMESTAMPTZ,
-    started_at       TIMESTAMPTZ,
-    finished_at      TIMESTAMPTZ,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    channel_ref          TEXT NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'pending',
+    stage                TEXT,
+    total_units          INTEGER,
+    completed_units      INTEGER NOT NULL DEFAULT 0,
+    total_comment_count  INTEGER,
+    cancel_requested     BOOLEAN NOT NULL DEFAULT FALSE,
+    error                TEXT,
+    claimed_at           TIMESTAMPTZ,
+    started_at           TIMESTAMPTZ,
+    finished_at          TIMESTAMPTZ,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Idempotent migration for installations created before total_comment_count
+-- existed (this sandbox's own dev database, notably).
+ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS total_comment_count INTEGER;
 
 CREATE TABLE IF NOT EXISTS analysis_job_batches (
     job_id       UUID NOT NULL REFERENCES analysis_jobs(id) ON DELETE CASCADE,
@@ -62,6 +67,14 @@ CREATE TABLE IF NOT EXISTS analysis_job_batches (
     completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (job_id, stage, batch_key)
 );
+
+-- SPEC §4.2: "Cache by video, not by request... key on (video_id,
+-- comment_count)." Approximated at channel granularity here (one job
+-- already covers a whole channel's videos): the most recent completed job
+-- for the same channel_ref with the same total_comment_count is reused
+-- instead of spending quota again.
+CREATE INDEX IF NOT EXISTS idx_analysis_jobs_cache_lookup
+    ON analysis_jobs (channel_ref, total_comment_count, status, created_at DESC);
 """
 
 
@@ -188,6 +201,37 @@ async def increment_completed_units(
     )
 
 
+async def set_total_comment_count(conn: asyncpg.Connection, job_id: str, n: int) -> None:
+    """SPEC §4.2's cache key's other half (channel_ref is the first) — set
+    once ingestion knows the real count, so a later analysis of the same
+    channel can tell whether anything changed."""
+    await conn.execute(
+        "UPDATE analysis_jobs SET total_comment_count = $2, updated_at = now() WHERE id = $1",
+        job_id, n,
+    )
+
+
+async def find_reusable_job(
+    conn: asyncpg.Connection, channel_ref: str, total_comment_count: int
+) -> str | None:
+    """SPEC §4.2: "Cache by video, not by request... If the comment count
+    hasn't moved, serve the cached analysis." The most recent *completed*
+    job for this exact (channel_ref, total_comment_count) pair, or None if
+    nothing matches — meaning either this channel was never analyzed, or
+    its comment count has moved since the last analysis.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT id FROM analysis_jobs
+        WHERE channel_ref = $1 AND total_comment_count = $2 AND status = 'completed'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        channel_ref, total_comment_count,
+    )
+    return str(row["id"]) if row is not None else None
+
+
 @dataclass(frozen=True)
 class JobProgress:
     job_id: str
@@ -196,6 +240,7 @@ class JobProgress:
     stage: str | None
     total_units: int | None
     completed_units: int
+    total_comment_count: int | None
     cancel_requested: bool
     error: str | None
     created_at: datetime
@@ -220,6 +265,7 @@ async def get_job_progress(conn: asyncpg.Connection, job_id: str) -> JobProgress
         stage=row["stage"],
         total_units=row["total_units"],
         completed_units=row["completed_units"],
+        total_comment_count=row["total_comment_count"],
         cancel_requested=row["cancel_requested"],
         error=row["error"],
         created_at=row["created_at"],
