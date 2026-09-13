@@ -2,7 +2,6 @@
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -62,7 +61,9 @@ class DeepMoodAnalysis(BaseModel):
 
 
 class EnrichedCommentRecord(DeepMoodAnalysis):
-    """Full analysis record persisted to DuckDB."""
+    """Full analysis record. (Persistence target is being rebuilt per
+    SPEC §4.3 — Postgres/Neon, not the DuckDB this record's shape predates.)
+    """
     comment_id: str
     platform: str | None = None
     author_handle: str | None = None
@@ -74,11 +75,18 @@ class EnrichedCommentRecord(DeepMoodAnalysis):
     processed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-class CrisisAlert(BaseModel):
-    """Phase 4: anomaly-radar output for a detected urgency surge."""
-    alert_id: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    severity: Literal["WARNING", "CRITICAL"]
-    theme: str = Field(description="3-word summary of the issue")
-    trigger_reason: str
-    affected_comment_ids: list[str]
+# ---------------------------------------------------------------------------
+# Stage A (SPEC §4.1, amended 2026-09-13 — see config/models.py). LLM-facing
+# batch contract for sentiment classification over 100% of comments, with
+# the §4.1b array-length + id-set guard engine/stage_a.py enforces.
+# ---------------------------------------------------------------------------
+
+class StageASentimentItem(BaseModel):
+    comment_id: str
+    sentiment: Sentiment
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class StageASentimentBatch(BaseModel):
+    """One LLM response for one batch of comments."""
+    results: list[StageASentimentItem]

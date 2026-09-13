@@ -135,6 +135,34 @@ of RAM for a free Streamlit Cloud container. Measure it. If it doesn't fit: int8
 versions (roughly 4x smaller, faster on CPU), or drop to a MiniLM-class embedding model, or move
 the host to Render / HF Spaces. Find out on day one, not on deploy day.
 
+> **Amendment, 2026-09-13 — Stage A moved to OpenRouter.** This build's operator was told all
+> four reasons above in full before deciding, and chose to route Stage A through OpenRouter
+> (`config/models.py::STAGE_A_SENTIMENT`, `STAGE_A_EMBEDDINGS`) instead of a local encoder.
+> Accepted tradeoffs, explicitly:
+>
+> 1. **Cost** no longer holds — Stage A now runs a paid LLM call over 100% of comments, not the
+>    ~10–20% Stage B sees. This is the dominant cost driver in the whole pipeline now, more so
+>    than Stage B or C.
+> 2. **Determinism** no longer holds structurally — an LLM call is not guaranteed to return the
+>    same label for the same input twice. `engine/stage_a.py`'s tests assert *shape and
+>    behavior* (batching, the §4.1b guard, error handling) against a stubbed API, not that a
+>    real call is reproducible.
+> 3. **Latency/quota** no longer holds — Stage A is now on the network, subject to OpenRouter
+>    rate limits and to the same "zero API keys" demo-fixture requirement (§6) as Stage B/C:
+>    the committed demo channel's cached analysis is what makes the 60-second zero-key demo
+>    work, not Stage A running offline.
+> 4. **Prompt-injection immunity is gone for Stage A.** This is the one that changes the
+>    security model, not just the cost model: comment text now flows into an LLM's context at
+>    100% coverage instead of 0%. §10's invariants 1 and 2 no longer "come free from the
+>    architecture" for Stage A the way this section originally argued — they now depend on the
+>    same schema-constrained-output defense Stage B/C always needed (Pydantic `Literal`/`Enum`
+>    fields, no free strings), which `engine/stage_a.py` applies via `StageASentimentBatch`.
+>    There is no local, non-LLM stage left in this pipeline that comment text bypasses.
+>
+> The §4.1b batching guard below — written with Stage B in mind — now applies to Stage A's
+> sentiment calls too, for exactly this reason, and `engine/stage_a.py` implements it there.
+> §7's stack table and §10's invariant table are updated to match.
+
 ### 4.1b Batching guard
 
 **Required guard:** validate that the returned array length equals the input batch length. Batched
@@ -242,8 +270,8 @@ This section exists because V2 was better engineered than this will be and still
 
 | Layer | Choice | Note |
 |---|---|---|
-| Classification + embeddings | Local encoder-only models (§4.1 Stage A) | Free, deterministic, injection-immune |
-| Generative inference | OpenRouter, open models | Two picks: cheap+schema-reliable for Stage B, strong for Stage C. Chosen by bake-off (§11). |
+| Classification + embeddings | ~~Local encoder-only models~~ **OpenRouter (§4.1 amendment, 2026-09-13)** | Was free/deterministic/injection-immune; now Stage A is a third OpenRouter consumer alongside B/C — see §4.1's amendment note for the accepted tradeoffs |
+| Generative inference | OpenRouter, open models | Three picks now (Stage A/B/C, not just B/C): cheap for A (runs on 100% of comments), cheap+schema-reliable for B, strong for C. Chosen by bake-off (§11). |
 | Orchestration | Plain async Python | No agent framework. There are no agents. |
 | Durable state | Postgres (Neon) | Anything you must not lose |
 | Shared/ephemeral state | **None in v1** | Redis arrives with the worker process, not before |
@@ -349,6 +377,17 @@ is wrong — not the prompt.
 **Where a guard model is actually worth it:** the synthesis/reduce step only (~8 calls per
 analysis), where many untrusted comments get fused into a claim the creator will act on. Never on
 the per-comment hot path.
+
+> **Amendment, 2026-09-13 — Stage A is now in scope for invariants 1 and 2.** §4.1's amendment
+> moved Stage A onto OpenRouter, so "an encoder has no instruction channel" no longer exempts it
+> — comment text now reaches an LLM at 100% coverage, on the per-comment hot path, which is
+> exactly the case the paragraph above says never to put a guard model on. The compensating
+> control is invariant 2 itself: `StageASentimentBatch` constrains Stage A's output to an
+> `Enum` sentiment field and a bounded `float` confidence, same as Stage B/C. A successful
+> injection against Stage A can, at most, talk the model into mislabeling *that one comment's*
+> sentiment — it still cannot produce a value outside the enum, call a tool, or reach anything
+> invariant 1 doesn't already keep out of the prompt. No guard model added here; the schema is
+> the containment, per the design principle above, not an exception to it.
 
 **Two more, easy now and painful to retrofit:** scrub PII *before* the Langfuse call, not after
 (a token or email interpolated into a traced prompt lives in Langfuse forever), and build the

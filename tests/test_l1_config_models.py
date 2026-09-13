@@ -48,13 +48,20 @@ def test_model_strings_appear_only_in_config_models():
 
 
 def test_embedding_dim_matches_stage_a_embedder():
-    # intfloat/multilingual-e5-small is a 384-dim model. If STAGE_A_EMBEDDINGS
-    # changes, EMBEDDING_DIM must change with it (SPEC §9.1: "dimension is
-    # your cheapest lever" — but only if the two constants stay in sync).
+    # If STAGE_A_EMBEDDINGS changes, EMBEDDING_DIM must change with it (SPEC
+    # §9.1: "dimension is your cheapest lever" — but only if the two
+    # constants stay in sync). Dimensions below are documented/native sizes,
+    # not independently confirmed against a live API response — see
+    # config/models.py's note on STAGE_A_EMBEDDINGS.
     known_dims = {
         "intfloat/multilingual-e5-small": 384,
         "intfloat/multilingual-e5-base": 768,
         "BAAI/bge-m3": 1024,
+        "openrouter/qwen/qwen3-embedding-0.6b": 1024,
+        "openrouter/qwen/qwen3-embedding-4b": 2560,
+        "openrouter/qwen/qwen3-embedding-8b": 4096,
+        "openrouter/openai/text-embedding-3-small": 1536,
+        "openrouter/openai/text-embedding-3-large": 3072,
     }
     expected = known_dims.get(models.STAGE_A_EMBEDDINGS)
     if expected is not None:
