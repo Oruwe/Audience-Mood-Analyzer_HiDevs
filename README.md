@@ -512,9 +512,10 @@ pytest -k invariant                 # just the security contract tests
 python -m evals.benchmark           # live sentiment accuracy + confusion matrix
 ```
 
-**232 passing, 44 skipped.** Almost all the skips are Postgres integration
-tests, which run automatically as soon as `DATABASE_URL` points at a reachable
-database; the one that stays skipped either way is invariant 5 (see below).
+**279 passing, 1 skipped** with a database reachable (234 passing, 46 skipped
+without one — the skips are the Postgres integration tests, which enable
+themselves as soon as `DATABASE_URL` points at a live database). The single
+test that stays skipped either way is invariant 5 (see below).
 
 Tests are organised in two levels:
 

@@ -137,3 +137,35 @@ def test_malformed_url_shows_a_clear_error_without_touching_the_network(monkeypa
     assert "not a youtube url at all" in at.error[0].value
     # Still on the input screen -- no job was ever started.
     assert len(at.status) == 0
+
+
+# ---------------------------------------------------------------------------
+# Progress polling must not depend on a third-party custom component.
+#
+# `streamlit-autorefresh` is a *custom component*: the browser fetches a
+# separate JavaScript bundle from the app server before it can tick. On the
+# Render deployment that fetch failed, and the failure mode is the worst
+# possible one — polling never starts, so a job that is running perfectly in
+# its background thread leaves the page on "Working…" indefinitely. The user
+# sees a hung analysis; the logs show a healthy one.
+#
+# `st.fragment(run_every=...)` is Streamlit's own scheduler with no asset to
+# download. This pins that choice: the failure it replaced was invisible to
+# every test we had, because it happens in the browser.
+# ---------------------------------------------------------------------------
+
+def test_progress_polling_uses_a_native_fragment_not_a_custom_component():
+    source = APP_PATH.read_text(encoding="utf-8")
+
+    assert "st.fragment(run_every=" in source, (
+        "progress polling must be driven by st.fragment(run_every=...)"
+    )
+    # The import specifically -- the docstring explaining why it is gone
+    # legitimately names the package.
+    assert "from streamlit_autorefresh import" not in source
+    assert "import streamlit_autorefresh" not in source
+
+
+def test_streamlit_autorefresh_is_not_a_declared_dependency():
+    requirements = (APP_PATH.parent / "requirements.txt").read_text(encoding="utf-8")
+    assert "streamlit-autorefresh" not in requirements

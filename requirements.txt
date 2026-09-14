@@ -23,7 +23,6 @@ httpx>=0.27             # YouTube API, OpenRouter embeddings, preflight probes
 python-dotenv           # loads .env for local dev; a no-op where the host sets real env vars
 
 streamlit               # app.py -- the only entrypoint
-streamlit-autorefresh   # progress polling without a blocking wait
 altair>=5.0             # mood distribution, confusion matrix, stage timing
 pandas>=2.2.2           # dataframes behind those charts
 numpy>=2.1              # embedding vectors, sentiment arithmetic

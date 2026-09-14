@@ -6,8 +6,8 @@ No FastAPI hop (SPEC §2's cut of server.py: "for one Streamlit app it is
 ceremony"). The expensive work — pulling comments, classifying them,
 synthesizing insights — runs in a background thread (orchestration.py),
 never blocking this script; this file only starts that job, polls its
-Postgres-backed progress (`st.status`, refreshed via `streamlit_autorefresh`
-rather than a real blocking wait), and renders SPEC §3's three insight
+Postgres-backed progress (`st.status`, refreshed by a `st.fragment`
+running on a timer rather than a real blocking wait), and renders SPEC §3's three insight
 blocks once it's done. SPEC §10 invariant 4 holds throughout, via
 `_as_literal_text`: every string that originates outside this system —
 comment quotes, YouTube-supplied titles, and model output derived from
@@ -30,13 +30,13 @@ import asyncio
 import logging
 import os
 import re
+from typing import Literal
 
 import altair as alt
 import httpx
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-from streamlit_autorefresh import st_autorefresh
 
 import config.models as models
 import evals.benchmark as benchmark
@@ -107,7 +107,7 @@ _STAGE_CHART_LABELS = {
 # actually produced, so the chart's shape doesn't jump around run to run.
 _SENTIMENT_ORDER = [s.value for s in Sentiment]
 
-POLL_INTERVAL_MS = 3_000
+POLL_INTERVAL_SECONDS = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -631,26 +631,68 @@ def _start_new_analysis(channel_ref: str) -> None:
     st.rerun()
 
 
-def _render_job(job_id: str) -> None:
-    # This runs every POLL_INTERVAL_MS for as long as a job is on screen, so
-    # it is the call most exposed to a momentary Postgres blip -- and the
-    # worst place to raise: the job itself is fine, running in its own
-    # thread, and crashing the render is what would lose the user's only
-    # handle on it. Report and let the next poll try again.
+def _safe_load_progress(job_id: str) -> JobProgress | None | Literal["unavailable"]:
+    """Read progress, treating a failed read as "ask again" rather than fatal.
+
+    This is the call most exposed to a momentary Postgres blip: it runs every
+    few seconds for as long as a job is on screen. It is also the worst place
+    to raise — the job itself is fine, running in its own thread, and crashing
+    the render is what would lose the user's only handle on it.
+    """
     try:
-        progress = _run_async(load_progress(job_id))
+        return _run_async(load_progress(job_id))
     except Exception as exc:  # noqa: BLE001 -- a poll failure is not a job failure
         logger.warning("Progress poll failed for job %s: %s", job_id, exc)
+        return "unavailable"
+
+
+@st.fragment(run_every=POLL_INTERVAL_SECONDS)
+def _poll_in_progress(job_id: str) -> None:
+    """Re-render just the progress panel every POLL_INTERVAL_SECONDS.
+
+    Uses `st.fragment(run_every=...)`, which is Streamlit's own scheduler,
+    rather than the `streamlit-autorefresh` component this used to call.
+    That component is a *custom component*: the browser has to fetch a
+    separate JavaScript bundle from the app server before it can tick. On
+    this deployment that fetch failed — Streamlit rendered "Your app is
+    having trouble loading the streamlit_autorefresh.st_autorefresh
+    component" — and when it fails, polling simply never starts. The job
+    runs to completion in its background thread and the page sits on
+    "Working…" forever, which reads to the user as a hung analysis. A
+    progress indicator that depends on a third-party asset download is a
+    single point of failure in front of work that is going fine.
+
+    `st.fragment` ships inside Streamlit, needs no extra asset, and reruns
+    only this function rather than the whole script — so the poll is also
+    cheaper than the full-page rerun it replaces.
+    """
+    progress = _safe_load_progress(job_id)
+
+    if progress == "unavailable":
         st.info("Still working — the progress read hiccuped, retrying…")
-        st_autorefresh(interval=POLL_INTERVAL_MS, key=f"poll_{job_id}")
+        return
+    if progress is None or progress.status not in ("pending", "running"):
+        # Terminal, or the row vanished. Break out of the fragment so the
+        # whole page re-renders and `_render_job` takes the finished path;
+        # results belong outside a fragment that is still on a timer.
+        st.rerun(scope="app")
+
+    _render_in_progress(job_id, progress)
+
+
+def _render_job(job_id: str) -> None:
+    progress = _safe_load_progress(job_id)
+
+    if progress == "unavailable":
+        st.info("Still working — the progress read hiccuped, retrying…")
+        _poll_in_progress(job_id)
         return
     if progress is None:
         st.error("Lost track of that analysis — please start a new one.")
         return
 
     if progress.status in ("pending", "running"):
-        _render_in_progress(job_id, progress)
-        st_autorefresh(interval=POLL_INTERVAL_MS, key=f"poll_{job_id}")
+        _poll_in_progress(job_id)
         return
 
     if progress.status == "failed":
