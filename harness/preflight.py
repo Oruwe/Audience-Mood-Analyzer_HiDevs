@@ -31,9 +31,11 @@ Design rules
    invocation tells you everything that's broken, not just the first
    thing.
 3. **Spend as close to nothing as possible.** Probes use 2-3 synthetic
-   comments. Real spend is measured, not estimated: OpenRouter's own
-   `/api/v1/key` endpoint reports cumulative credit usage, so the report
-   quotes the actual before/after delta.
+   comments. Spend is read from OpenRouter's own `/api/v1/key` cumulative
+   usage counter as a before/after delta rather than estimated from token
+   guesses — with the caveat, observed live, that the counter settles
+   behind the calls, so a short run often reports a zero delta it did not
+   actually achieve. The report says so rather than printing the zero.
 4. **Be honest about what wasn't checked.** A SKIP is reported as loudly
    as a FAIL; a check that couldn't run is never quietly counted as
    passing.
@@ -471,7 +473,19 @@ def format_report(report: PreflightReport) -> str:
         f"{counts[FAIL]} failed · {counts[SKIP]} skipped"
     )
     if report.credits_spent is not None:
-        lines.append(f"OpenRouter credit actually spent by this run: ${report.credits_spent:.6f}")
+        if report.credits_spent > 0:
+            lines.append(f"OpenRouter credit spent by this run: ${report.credits_spent:.6f}")
+        else:
+            # Observed live 2026-09-14: a run that made ~10 real model calls
+            # still reported a zero delta, because OpenRouter's /api/v1/key
+            # usage counter settles behind the calls themselves. Printing a
+            # bare "$0.000000" would be a confident lie; say what actually
+            # happened instead.
+            lines.append(
+                "OpenRouter credit spent by this run: not yet reflected in the "
+                "provider's usage counter (it lags); the probes above did make "
+                "real calls."
+            )
     if report.failed:
         lines.append("")
         lines.append("NOT READY — fix the failures above before running a real analysis.")

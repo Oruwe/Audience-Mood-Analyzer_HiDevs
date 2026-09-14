@@ -232,20 +232,35 @@ STAGE_B_CLASSIFY = "openrouter/openai/gpt-4.1-mini"
 # supports_response_schema. Different vendor (Qwen) from Stage A's Mistral,
 # so one provider's capacity event can't stall both stages at once.
 
-STAGE_C_SYNTHESIS_FALLBACK = "openrouter/openai/gpt-4.1-mini"
-# $0.400/$1.600 per M. A true peer of the primary, deliberately: Stage C
-# is the only stage whose output a human reads, and a failure here wastes
-# every earlier stage's completed work. Different vendor (OpenAI) from the
-# primary (Google).
+STAGE_C_SYNTHESIS_FALLBACK = "openrouter/mistralai/mistral-medium-3.1"
+# $0.400/$2.000 per M. Different vendor (Mistral) from the primary
+# (OpenAI) and distinct from every other stage's fallback. Its verbatim-
+# copy behaviour is NOT yet verified live -- harness/preflight.py probes
+# exactly that on the next run, which is the point of having the probe.
 
-STAGE_C_SYNTHESIS = "openrouter/google/gemini-2.5-flash"
-# $0.300/$2.500 per M, ~8 calls per analysis (~$0.014). SPEC §11 says
-# "pick Stage C on quality, price is noise at ~8 calls", and this stage
-# has the hardest constraint in the pipeline: every quote it returns is
-# checked character-by-character against the real comment corpus
-# (schemas.py's _validate_quotes_verbatim), and a single "tidied" quote
-# discards the whole insight block. Exact-copy discipline under a long
-# instruction is precisely what separates model tiers here.
+STAGE_C_SYNTHESIS = "openrouter/openai/gpt-4.1-mini"
+# $0.400/$1.600 per M, ~8 calls per analysis. SPEC §11 says "pick Stage C
+# on quality, price is noise at ~8 calls" -- but this stage has the
+# hardest constraint in the pipeline, and it is not the one "quality"
+# usually means: every quote is checked character-by-character against the
+# real comment corpus (schemas.py's _validate_quotes_verbatim), and a
+# single altered quote discards the whole insight block rather than
+# degrading it.
+#
+# Measured, not reasoned (2026-09-14, harness/preflight.py's first fully
+# live run): google/gemini-2.5-flash -- a strictly stronger model by
+# general benchmarks, and this constant's previous value -- FAILED that
+# check on its first probe. Given the comment "this finally made sense to
+# me, thank you!!" it returned "...thank thank you!!", duplicating a word
+# while copying. Not a paraphrase, not a summary: a corrupted copy, which
+# on a real run would have silently emptied insight blocks with no error
+# anyone would see. gpt-4.1-mini, sitting beside it as the fallback in the
+# same run, returned 3 quotes that all passed.
+#
+# So this pick is deliberately NOT the highest-capability option
+# available. Exact-copy discipline is the binding constraint here, general
+# reasoning strength is not, and those two rank models differently -- a
+# distinction only a live probe against the real validator could surface.
 # Role: one call per cluster (capped at 8) producing an insight block and
 # selecting verbatim quotes. Paid, alongside Stage A/B -- at ~8 calls per
 # analysis the free tier's throttling risk was the lowest here, but it was
