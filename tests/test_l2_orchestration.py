@@ -555,3 +555,101 @@ def test_a_running_job_heartbeats_so_the_reaper_leaves_it_alone(monkeypatch, pg_
     # Claim + every checkpointed batch touches it, so it is set well before
     # the periodic task's first tick.
     assert progress.heartbeat_at is not None
+
+
+# ---------------------------------------------------------------------------
+# Ingestion concurrency.
+#
+# This is the regression that cost a live analysis its entire 15-minute
+# deadline (2026-09-14, job 3e998fba). Ingestion was the only serial stage in
+# the pipeline, so it was also the only one whose cost scaled with channel
+# size -- and because it makes no LLM calls, it failed by being slow rather
+# than by raising, leaving no warnings and no errors to diagnose from.
+#
+# Asserting "it finished" would not catch a return to sequential: the
+# sequential version finished too, just far too slowly. So these assert the
+# property that actually differs -- overlap -- and the ordering guarantee the
+# rewrite had to preserve while gaining it.
+# ---------------------------------------------------------------------------
+
+def test_ingestion_fetches_videos_concurrently(monkeypatch, pg_dsn):
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    video_specs = [(f"v{i}", 1) for i in range(8)]
+    calls: dict = {}
+    _install_happy_path_mocks(monkeypatch, video_specs=video_specs, calls=calls)
+
+    in_flight = 0
+    peak_in_flight = 0
+
+    async def slow_fetch(video_id, **kwargs):
+        nonlocal in_flight, peak_in_flight
+        in_flight += 1
+        peak_in_flight = max(peak_in_flight, in_flight)
+        try:
+            await asyncio.sleep(0.05)  # a network round-trip's worth of yielding
+            yield _comment(video_id, 0)
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(orchestration, "fetch_video_comments", slow_fetch)
+
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            from storage.postgres import create_job
+            job_id = await create_job(conn, "chan")
+        finally:
+            await conn.close()
+        return await orchestration.analyze_channel(
+            job_id, "chan", youtube_api_key="yt", openrouter_api_key="or",
+        )
+
+    _run(scenario())
+
+    # Sequential ingestion never exceeds 1. The exact peak depends on
+    # scheduling, so this asserts overlap happened at all rather than
+    # pinning a number.
+    assert peak_in_flight > 1, (
+        f"ingestion ran {peak_in_flight} video(s) at a time — it is sequential again"
+    )
+    assert peak_in_flight <= orchestration.MAX_CONCURRENT_BATCHES
+
+
+def test_ingestion_returns_comments_in_channel_order_not_completion_order(monkeypatch, pg_dsn):
+    """Concurrency must not reorder the corpus.
+
+    Downstream batch keys are positional slices of this list, and a resumed
+    job rebuilds it from a mix of checkpointed and freshly-fetched videos. If
+    completion order leaked through, a resume would produce a different
+    corpus from the run it is resuming.
+    """
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    video_specs = [("v0", 1), ("v1", 1), ("v2", 1)]
+    calls: dict = {}
+    _install_happy_path_mocks(monkeypatch, video_specs=video_specs, calls=calls)
+
+    # Finish in reverse order: v2 first, v0 last.
+    delays = {"v0": 0.06, "v1": 0.03, "v2": 0.0}
+
+    async def staggered_fetch(video_id, **kwargs):
+        await asyncio.sleep(delays[video_id])
+        yield _comment(video_id, 0)
+
+    monkeypatch.setattr(orchestration, "fetch_video_comments", staggered_fetch)
+
+    async def scenario():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await init_schema(conn)
+            from storage.postgres import create_job
+            job_id = await create_job(conn, "chan")
+        finally:
+            await conn.close()
+        return await orchestration.analyze_channel(
+            job_id, "chan", youtube_api_key="yt", openrouter_api_key="or",
+        )
+
+    result = _run(scenario())
+
+    assert [c.video_id for c in result.comments] == ["v0", "v1", "v2"]

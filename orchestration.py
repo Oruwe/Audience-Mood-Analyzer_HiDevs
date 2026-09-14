@@ -42,6 +42,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import httpx
@@ -162,7 +164,31 @@ async def _run_ingestion(
     conn, job_id: str, estimate, *, client: httpx.AsyncClient, youtube_api_key: str,
     ledger: QuotaLedger, dedup: ContentDeduplicator,
 ) -> list[RawComment]:
-    """One checkpoint unit = one video's comments."""
+    """One checkpoint unit = one video's comments.
+
+    Videos are fetched concurrently, bounded by MAX_CONCURRENT_BATCHES, for
+    the same reason Stage A/B batches are: they are independent network
+    round-trips. This loop used to be strictly sequential, and it was the
+    only serial stage in the pipeline -- which made it the one that scaled
+    with channel size while nothing else did. A channel with a few hundred
+    videos spent its entire 15-minute deadline here, making zero LLM calls,
+    so it produced no warnings and no errors: fifteen minutes of silence
+    ending in a timeout (observed live, 2026-09-14, job 3e998fba).
+
+    Concurrency is safe for the two pieces of shared state this touches, and
+    the reason is worth stating because it is not obvious. `ledger.charge`
+    is plain synchronous arithmetic, and `dedup.is_duplicate`, despite being
+    `async def`, contains no `await` in either backend's body -- so both run
+    to completion without yielding, and asyncio cannot interleave them. The
+    Postgres writes are the part that genuinely cannot overlap (one asyncpg
+    connection per job, no concurrent queries), hence `db_lock`, exactly as
+    the Stage A/B runners do it.
+
+    One accepted imprecision: `fetch_video_comments` checks the quota budget
+    before charging it, so up to MAX_CONCURRENT_BATCHES calls can pass the
+    check before any of them charge. The overshoot is bounded by 8 units
+    against a 10,000-unit daily budget.
+    """
     done = await get_completed_batch_keys(conn, job_id, STAGE_INGESTION)
     cached = await get_batch_results(conn, job_id, STAGE_INGESTION)
     comments: list[RawComment] = []
@@ -177,13 +203,10 @@ async def _run_ingestion(
         total_units=len(estimate.videos), completed_units=already_done,
     )
 
-    for video in estimate.videos:
-        await _check_cancel(conn, job_id)
-        if video.video_id in done:
-            comments.extend(
-                RawComment.model_validate(d) for d in cached[video.video_id]["comments"]
-            )
-            continue
+    await _check_cancel(conn, job_id)
+    db_lock = asyncio.Lock()
+
+    async def _fetch_one(video) -> list[RawComment]:
         video_comments = (
             [
                 c async for c in fetch_video_comments(
@@ -194,13 +217,35 @@ async def _run_ingestion(
             if video.comment_count > 0
             else []
         )
-        await record_batch_result(
-            conn, job_id, STAGE_INGESTION, video.video_id,
-            result={"comments": [c.model_dump(mode="json") for c in video_comments]},
-        )
-        await increment_completed_units(conn, job_id, by=1)
-        await touch_heartbeat(conn, job_id)
-        comments.extend(video_comments)
+        async with db_lock:
+            await record_batch_result(
+                conn, job_id, STAGE_INGESTION, video.video_id,
+                result={"comments": [c.model_dump(mode="json") for c in video_comments]},
+            )
+            await increment_completed_units(conn, job_id, by=1)
+            await touch_heartbeat(conn, job_id)
+        return video_comments
+
+    pending = [v for v in estimate.videos if v.video_id not in done]
+    logger.info(
+        "Stage ingestion: %d video(s), %d already checkpointed, %d to fetch",
+        len(estimate.videos), already_done, len(pending),
+    )
+    fetched = dict(zip(
+        (v.video_id for v in pending),
+        await _bounded_gather([_fetch_one(v) for v in pending]),
+    ))
+
+    # Rebuild in channel order rather than completion order: a resumed job
+    # must produce the same comment list as a fresh one, and downstream
+    # batch keys are positional slices of this list.
+    for video in estimate.videos:
+        if video.video_id in done:
+            comments.extend(
+                RawComment.model_validate(d) for d in cached[video.video_id]["comments"]
+            )
+        else:
+            comments.extend(fetched[video.video_id])
     return comments
 
 
@@ -337,6 +382,48 @@ async def _run_stage_c(
     return result
 
 
+
+@asynccontextmanager
+async def _stage_timer(job_id: str, stage: str, size: int | None = None):
+    """Log a stage's start and finish, with wall-clock elapsed.
+
+    Added after a job burned its whole 15-minute deadline and left exactly
+    two lines in the logs: the boot preflight, and the deadline firing
+    (2026-09-14, job 3e998fba). Every logging statement in this pipeline
+    was on an exception path, so a run that fails by being *slow* rather
+    than by raising produced no evidence at all, and the stall could only
+    be located by reading the source and reasoning about which stage was
+    serial. That is not a diagnosis, it is a guess that happened to be
+    right.
+
+    So the happy path talks now. One line in, one line out, per stage: the
+    difference between "which stage was it in?" being a five-second log
+    read and being an afternoon.
+    """
+    logger.info(
+        "Job %s: stage %s starting%s",
+        job_id, stage, f" ({size} item(s))" if size is not None else "",
+    )
+    started = time.monotonic()
+    try:
+        yield
+    except BaseException as exc:
+        # BaseException, not Exception, and that is the whole point: the
+        # deadline stops a job by CANCELLING it, and asyncio.CancelledError
+        # is a BaseException. Catching only Exception here would stay silent
+        # in precisely the case this logging was added for -- naming the
+        # stage a timed-out job died in.
+        logger.warning(
+            "Job %s: stage %s DID NOT FINISH after %.1fs: %s: %s",
+            job_id, stage, time.monotonic() - started, type(exc).__name__, exc,
+        )
+        raise
+    else:
+        logger.info(
+            "Job %s: stage %s done in %.1fs", job_id, stage, time.monotonic() - started,
+        )
+
+
 async def analyze_channel(
     job_id: str,
     channel_ref: str,
@@ -360,14 +447,16 @@ async def analyze_channel(
         dedup = ContentDeduplicator()
 
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            estimate = await estimate_channel_analysis(
-                channel_ref, client=client, api_key=youtube_api_key,
-                ledger=ledger, max_videos=max_videos,
-            )
-            comments = await _run_ingestion(
-                conn, job_id, estimate, client=client, youtube_api_key=youtube_api_key,
-                ledger=ledger, dedup=dedup,
-            )
+            async with _stage_timer(job_id, "resolve"):
+                estimate = await estimate_channel_analysis(
+                    channel_ref, client=client, api_key=youtube_api_key,
+                    ledger=ledger, max_videos=max_videos,
+                )
+            async with _stage_timer(job_id, "ingestion", len(estimate.videos)):
+                comments = await _run_ingestion(
+                    conn, job_id, estimate, client=client, youtube_api_key=youtube_api_key,
+                    ledger=ledger, dedup=dedup,
+                )
             # SPEC §4.2 cache key's other half (channel_ref is set at
             # create_job time) -- lets a later analysis of this channel at
             # the same comment count find and reuse this job instead of
@@ -375,31 +464,39 @@ async def analyze_channel(
             await set_total_comment_count(conn, job_id, len(comments))
 
             await _check_cancel(conn, job_id)
-            sentiments = await _run_checkpointed_pydantic_batches(
-                conn, job_id, STAGE_SENTIMENT, comments, DEFAULT_SENTIMENT_BATCH_SIZE,
-                item_model=StageASentimentItem,
-                run_batch=lambda batch: classify_sentiment_batch(batch, api_key=openrouter_api_key),
-            )
+            async with _stage_timer(job_id, "A/sentiment", len(comments)):
+                sentiments = await _run_checkpointed_pydantic_batches(
+                    conn, job_id, STAGE_SENTIMENT, comments, DEFAULT_SENTIMENT_BATCH_SIZE,
+                    item_model=StageASentimentItem,
+                    run_batch=lambda batch: classify_sentiment_batch(batch, api_key=openrouter_api_key),
+                )
 
             await _check_cancel(conn, job_id)
-            embeddings = await _run_stage_a_embeddings(
-                conn, job_id, comments, client=client, api_key=openrouter_api_key
-            )
+            async with _stage_timer(job_id, "A/embeddings", len(comments)):
+                embeddings = await _run_stage_a_embeddings(
+                    conn, job_id, comments, client=client, api_key=openrouter_api_key
+                )
 
             await _check_cancel(conn, job_id)
             flagged = select_for_stage_b(comments, sentiments, embeddings)
-            stage_b_results = await _run_checkpointed_pydantic_batches(
-                conn, job_id, STAGE_CLASSIFY, flagged, STAGE_B_BATCH_SIZE,
-                item_model=StageBClassificationItem,
-                run_batch=lambda batch: stage_b_classify_batch(batch, api_key=openrouter_api_key),
+            logger.info(
+                "Job %s: stage filter promoted %d of %d comment(s) to Stage B",
+                job_id, len(flagged), len(comments),
             )
+            async with _stage_timer(job_id, "B/classify", len(flagged)):
+                stage_b_results = await _run_checkpointed_pydantic_batches(
+                    conn, job_id, STAGE_CLASSIFY, flagged, STAGE_B_BATCH_SIZE,
+                    item_model=StageBClassificationItem,
+                    run_batch=lambda batch: stage_b_classify_batch(batch, api_key=openrouter_api_key),
+                )
 
             await _check_cancel(conn, job_id)
             video_titles = {v.video_id: v.title for v in estimate.videos}
-            insights = await _run_stage_c(
-                conn, job_id, comments, sentiments, stage_b_results, embeddings, video_titles,
-                api_key=openrouter_api_key,
-            )
+            async with _stage_timer(job_id, "C/synthesis"):
+                insights = await _run_stage_c(
+                    conn, job_id, comments, sentiments, stage_b_results, embeddings, video_titles,
+                    api_key=openrouter_api_key,
+                )
 
     return AnalysisResult(
         job_id=job_id, channel_ref=channel_ref, comments=comments,
