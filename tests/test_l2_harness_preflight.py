@@ -239,11 +239,7 @@ def test_chat_probe_fails_when_a_model_does_not_echo_ids_exactly(monkeypatch):
 
 def test_chat_probe_passes_when_ids_are_echoed_exactly(monkeypatch):
     async def faithful_acompletion(*, model, messages, **kwargs):
-        ids = [
-            line.split(":", 1)[0]
-            for line in messages[-1]["content"].splitlines()
-            if line.strip()
-        ]
+        ids = [c["comment_id"] for c in json.loads(messages[-1]["content"])]
         payload = json.dumps({"results": [
             {"comment_id": cid, "sentiment": "positive", "confidence": 0.9} for cid in ids
         ]})

@@ -18,6 +18,7 @@ Every stage's response schema must follow one shape:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 import openai
@@ -93,6 +94,35 @@ async def _call_model_with_fallback(
     raise last_exc
 
 
+def as_batch_payload(comments: list[RawComment]) -> str:
+    """Serialise a batch as a JSON array, not one `id: text` line each.
+
+    The line-per-comment format this used to send was ambiguous, and the
+    ambiguity was expensive. ingestion/normalizer.py deliberately PRESERVES
+    newlines inside comment text (they carry meaning, and Stage C's
+    verbatim-quote validator compares against the stored text exactly), so
+    a comment containing a line break became several lines in the prompt,
+    with the continuation lines carrying no `id:` prefix. The model then
+    could not tell where one comment ended and the next began, and
+    returned the wrong number of results -- tripping the §4.1b guard.
+
+    Splitting could not repair that: the multi-line comment is still
+    multi-line in each half, so one offending comment cascaded a 28-item
+    batch down through 14, 7, ... to single-item batches, each level a
+    fresh sequential model call. Observed live (2026-09-14) as the single
+    biggest contributor to a 90s analysis, and it explains why upgrading
+    models never silenced the mismatch warnings -- the fault was in this
+    payload, not in any model.
+
+    JSON escapes the newlines, so structure is unambiguous while the text
+    the model receives (and must quote back verbatim) stays byte-identical.
+    """
+    return json.dumps(
+        [{"comment_id": c.id, "text": c.text} for c in comments],
+        ensure_ascii=False,
+    )
+
+
 async def run_batched_llm_classification(
     comments: list[RawComment],
     *,
@@ -121,10 +151,9 @@ async def run_batched_llm_classification(
     if not comments:
         return {}
 
-    lines = "\n".join(f"{c.id}: {c.text}" for c in comments)
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": lines},
+        {"role": "user", "content": as_batch_payload(comments)},
     ]
     response = await _call_model_with_fallback(
         (model, *fallback_models), api_key, messages, response_schema, stage_label=stage_label,
@@ -148,15 +177,20 @@ async def run_batched_llm_classification(
         stage_label, len(comments),
     )
     mid = len(comments) // 2
-    left = await run_batched_llm_classification(
-        comments[:mid], api_key=api_key, model=model, system_prompt=system_prompt,
-        response_schema=response_schema, stage_label=stage_label, error_cls=error_cls,
-        fallback_models=fallback_models,
-    )
-    right = await run_batched_llm_classification(
-        comments[mid:], api_key=api_key, model=model, system_prompt=system_prompt,
-        response_schema=response_schema, stage_label=stage_label, error_cls=error_cls,
-        fallback_models=fallback_models,
+    # The two halves are independent -- run them together. When a split
+    # cascades several levels deep this is the difference between paying
+    # each level's latency once and paying it 2^depth times in sequence.
+    left, right = await asyncio.gather(
+        run_batched_llm_classification(
+            comments[:mid], api_key=api_key, model=model, system_prompt=system_prompt,
+            response_schema=response_schema, stage_label=stage_label, error_cls=error_cls,
+            fallback_models=fallback_models,
+        ),
+        run_batched_llm_classification(
+            comments[mid:], api_key=api_key, model=model, system_prompt=system_prompt,
+            response_schema=response_schema, stage_label=stage_label, error_cls=error_cls,
+            fallback_models=fallback_models,
+        ),
     )
     return {**left, **right}
 

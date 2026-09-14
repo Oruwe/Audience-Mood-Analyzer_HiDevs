@@ -8,6 +8,7 @@ is actually called from, so that's what gets patched here.
 """
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -35,7 +36,6 @@ def _fake_response(json_text: str) -> SimpleNamespace:
 
 
 def _valid_batch_json(comments: list[RawComment]) -> str:
-    import json
     return json.dumps({
         "results": [
             {"comment_id": c.id, "sentiment": "positive", "confidence": 0.8} for c in comments
@@ -77,11 +77,13 @@ def test_length_mismatch_splits_batch_and_retries(monkeypatch):
 
     async def fake_acompletion(**kwargs):
         content = kwargs["messages"][1]["content"]
-        requested_ids = [line.split(":")[0] for line in content.splitlines()]
+        # Payload is a JSON array of {comment_id, text} (engine.batching.
+        # as_batch_payload) -- a comment whose text contains newlines is
+        # still exactly one element, which is the whole point of it.
+        requested_ids = [c["comment_id"] for c in json.loads(content)]
         calls.append(requested_ids)
         if len(requested_ids) == 4:
             # Simulate a dropped item: only return half of what was asked.
-            import json
             return _fake_response(json.dumps({
                 "results": [{"comment_id": requested_ids[0], "sentiment": "neutral", "confidence": 0.5}]
             }))
@@ -103,7 +105,6 @@ def test_id_set_mismatch_counts_as_invalid_even_with_correct_length(monkeypatch)
     comments = [_comment(i) for i in range(2)]
 
     async def fake_acompletion(**kwargs):
-        import json
         # Right count, wrong ids entirely.
         return _fake_response(json.dumps({
             "results": [
@@ -141,7 +142,6 @@ def test_injection_cannot_produce_an_out_of_enum_sentiment(monkeypatch):
     )
 
     async def fake_acompletion(**kwargs):
-        import json
         return _fake_response(json.dumps({
             "results": [{"comment_id": "c0", "sentiment": "DEFINITELY_HACKED", "confidence": 0.99}]
         }))
@@ -157,7 +157,7 @@ def test_classify_all_sentiments_batches_at_the_configured_size(monkeypatch):
 
     async def fake_acompletion(**kwargs):
         content = kwargs["messages"][1]["content"]
-        n = len(content.splitlines())
+        n = len(json.loads(content))
         seen_batch_sizes.append(n)
         batch = [c for c in comments if c.id in content]
         return _fake_response(_valid_batch_json(batch))
@@ -169,3 +169,49 @@ def test_classify_all_sentiments_batches_at_the_configured_size(monkeypatch):
 
     assert set(result.keys()) == {c.id for c in comments}
     assert seen_batch_sizes == [4, 4, 2]
+
+
+def test_a_comment_containing_newlines_does_not_trigger_a_spurious_split(monkeypatch):
+    """The single biggest latency bug found in production (2026-09-14).
+
+    ingestion/normalizer.py deliberately preserves newlines inside comment
+    text. The payload used to be one `id: text` line per comment, so a
+    comment with a line break became several lines, the continuation lines
+    carried no id, and the model could not tell where one comment ended --
+    returning the wrong count and tripping the §4.1b guard.
+
+    Splitting could never fix it (the comment is still multi-line in each
+    half), so one such comment cascaded a batch down through 14, 7, ... to
+    single items, each level a fresh model call. This asserts the payload
+    is now unambiguous: a well-behaved model sees exactly as many items as
+    there are comments, so no split happens at all.
+    """
+    comments = [
+        _comment(0),
+        RawComment(
+            id="multiline-1", platform="youtube",
+            text="line one\nline two\n\nline four",  # the shape that broke it
+            timestamp=datetime.now(timezone.utc), video_id="v1",
+        ),
+        _comment(2),
+    ]
+    calls: list[int] = []
+
+    async def fake_acompletion(**kwargs):
+        payload = json.loads(kwargs["messages"][1]["content"])
+        calls.append(len(payload))
+        # A model that counts the JSON array correctly -- which is only
+        # possible because the newlines are escaped inside a string value.
+        return _fake_response(json.dumps({"results": [
+            {"comment_id": item["comment_id"], "sentiment": "neutral", "confidence": 0.5}
+            for item in payload
+        ]}))
+
+    monkeypatch.setattr(batching, "acompletion", fake_acompletion)
+    result = asyncio.run(stage_a.classify_sentiment_batch(comments, api_key=API_KEY))
+
+    assert calls == [3]                      # exactly one call: no split, no cascade
+    assert set(result) == {c.id for c in comments}
+    # And the multi-line text reached the model byte-identical, which is what
+    # lets Stage C quote it back verbatim past schemas.py's validator.
+    assert "line one\nline two\n\nline four" in [c.text for c in comments]

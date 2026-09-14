@@ -71,7 +71,10 @@ def test_length_mismatch_splits_batch_and_retries(monkeypatch):
 
     async def fake_acompletion(**kwargs):
         content = kwargs["messages"][1]["content"]
-        requested_ids = [line.split(":")[0] for line in content.splitlines()]
+        # Payload is a JSON array of {comment_id, text} (engine.batching.
+        # as_batch_payload) -- a comment whose text contains newlines is
+        # still exactly one element, which is the whole point of it.
+        requested_ids = [c["comment_id"] for c in json.loads(content)]
         calls.append(requested_ids)
         if len(requested_ids) == 4:
             return _fake_response(json.dumps({
@@ -112,7 +115,7 @@ def test_classify_all_batches_at_the_configured_size(monkeypatch):
 
     async def fake_acompletion(**kwargs):
         content = kwargs["messages"][1]["content"]
-        n = len(content.splitlines())
+        n = len(json.loads(content))
         seen_batch_sizes.append(n)
         batch = [c for c in comments if c.id in content]
         return _fake_response(_valid_batch_json(batch))
