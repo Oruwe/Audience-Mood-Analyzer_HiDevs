@@ -35,7 +35,7 @@ from streamlit_autorefresh import st_autorefresh
 
 import config.models as models
 import evals.benchmark as benchmark
-from harness.preflight import run_preflight
+from harness.preflight import format_report, run_preflight
 from ingestion.youtube import (
     QuotaEstimate,
     QuotaExceededError,
@@ -497,6 +497,39 @@ def _render_eval_section() -> None:
             st.dataframe(pd.DataFrame(rows).set_index("label"), width="stretch")
 
 
+@st.cache_resource(show_spinner=False)
+def _boot_preflight() -> str | None:
+    """Run preflight once per container at startup and log the report.
+
+    Exists because production is otherwise unobservable from where this
+    code is developed: the build sandbox can reach neither openrouter.ai
+    nor this app's own URL, so the only channel into the deployed
+    environment is Render's log API. Printing the report to stdout turns
+    that one-way channel into a usable verification loop -- the same
+    checks a human would run from the diagnostics panel, readable from
+    the logs without anyone clicking anything.
+
+    Gated on PREFLIGHT_ON_BOOT so it is opt-in: it makes a handful of real
+    (if tiny) model calls, and paying that on every cold start of a
+    free-tier service that sleeps aggressively should be a deliberate
+    choice, not a default. @st.cache_resource keeps it to once per
+    container rather than once per script rerun -- Streamlit re-executes
+    this module on every interaction, which would otherwise turn a
+    diagnostic into a per-click charge.
+    """
+    if os.environ.get("PREFLIGHT_ON_BOOT", "").strip().lower() not in ("1", "true", "yes"):
+        return None
+    try:
+        report = _run_async(run_preflight())
+    except Exception as exc:  # noqa: BLE001 -- diagnostics must never block the app
+        logger.error("Boot preflight could not run: %s: %s", type(exc).__name__, exc)
+        return None
+    # One multi-line block, logged whole: Render's log viewer interleaves
+    # concurrent lines, and a report split across entries is unreadable.
+    logger.warning("BOOT PREFLIGHT\n%s", format_report(report))
+    return "ready" if report.ready else "not-ready"
+
+
 def main() -> None:
     st.set_page_config(page_title="Audience Mood Analyzer", page_icon="🎥", layout="wide")
     st.title("🎥 Audience Mood Analyzer")
@@ -513,6 +546,8 @@ def main() -> None:
             "Copy .env.example to .env, fill these in, and restart the app."
         )
         st.stop()
+
+    _boot_preflight()
 
     _render_models_in_use()
     _render_preflight_section()

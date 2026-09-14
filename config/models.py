@@ -66,6 +66,23 @@ single provider event can take out two stages' insurance at once. The
 added cost is genuinely ~nil: fallbacks only run when a primary has
 already failed.
 
+--- Upgraded off the cheapest tier (2026-09-14) ---
+Asked to "use a good model to skip rate limiting". Half of that premise
+was already handled and worth recording so it isn't re-litigated: the
+429s were `limit_source: upstream_provider_shared_pool`, a *free*-tier
+artifact, and paying anything at all had already left that pool. Model
+strength buys nothing against a rate limit you are no longer subject to.
+
+The other half was real, and visible in the same logs: repeated "batch of
+N returned a length/id mismatch; splitting and retrying" from §4.1b's
+guard. Every one of those is a model failing to honour the output
+contract, and every one costs a doubled call for that batch — so on this
+pipeline, structured-output reliability *is* a latency lever, not merely
+a quality preference. All three generative stages moved up a tier for
+that reason. A 500-comment analysis now costs roughly $0.03 all-in
+(~30 per dollar), against a few tenths of a cent before — bought back in
+retries not taken, and in Stage C quotes that survive validation.
+
 --- Why not the local encoder SPEC §4.1 originally specified? (2026-09-13) ---
 Asked directly, and worth recording since every failure above is exactly
 what §4.1 predicted would happen once Stage A left the encoder. The
@@ -110,30 +127,29 @@ for exactly this reason — it's no longer just Stage B's problem.
 # see the module docstring above and SPEC.md §4.1)
 # ---------------------------------------------------------------------------
 
-STAGE_A_SENTIMENT_FALLBACK = "openrouter/meta-llama/llama-3.1-8b-instruct"
-# Paid, for the reason recorded in the module docstring's "insurance that
-# routes back into the fire" note: a free fallback is only insurance if
-# it answers when called, and the free pool demonstrably does not.
-# $0.050/$0.080 per M. Different vendor (Meta) from the primary (Mistral).
+STAGE_A_SENTIMENT_FALLBACK = "openrouter/google/gemini-2.5-flash-lite"
+# $0.100/$0.400 per M. Different vendor (Google) from the primary
+# (OpenAI), and a peer of it rather than a downgrade: a fallback that is
+# materially worse than its primary silently degrades quality at exactly
+# the moment nobody is watching, which is its own kind of outage.
 
-STAGE_A_SENTIMENT = "openrouter/mistralai/mistral-nemo"
+STAGE_A_SENTIMENT = "openrouter/openai/gpt-4.1-nano"
 # Runs on every comment (not a filtered subset like Stage B/C), so this is
 # the highest-volume call in the whole pipeline — a five-way sentiment
-# label, about the easiest task an LLM can be asked to do. Moved back to a
-# paid model (2026-09-13, same day as the free-tier switch) after a real
-# analysis measured 6+ minutes in this stage alone, hitting the same
-# "upstream_provider_shared_pool" 429 on effectively every batch -- see
-# this file's module docstring for the incident and the operator's
-# explicit choice to pay for lower latency here specifically. Picked from
-# litellm's maintained cost map filtered to `openrouter/*` chat models
-# declaring `supports_response_schema: true`: the single cheapest paid
-# entry once the `openrouter/auto` and `openrouter/free` meta-routers are
-# excluded (those route to a different pinned model per call, which would
-# silently reintroduce non-determinism a fixed string is supposed to
-# avoid) -- $0.019/$0.030 per M input/output tokens, cheaper even than the
-# very first paid pick this file ever made. Dedicated (not shared-pool)
-# capacity is the actual point of paying here, not the price itself,
-# which is still effectively noise for a five-way classification task.
+# label, about the easiest task an LLM can be asked to do.
+# $0.100/$0.400 per M.
+#
+# Upgraded from the cheapest-available tier (mistral-nemo, $0.019/$0.030)
+# for a reason that is NOT rate limiting -- that was a free-tier
+# shared-pool artifact and paying anything at all already fixed it. The
+# actual problem the upgrade targets is in the same logs: repeated
+# "batch of N returned a length/id mismatch; splitting and retrying"
+# from engine/batching.py's §4.1b guard. Each of those is the model
+# breaking the output contract, and each one costs a *doubled* call for
+# that batch -- so contract adherence is a latency lever, not just a
+# quality one. Structured-output reliability is what is being bought
+# here; at 5x the old price it is still ~$0.007 for a 500-comment
+# analysis, which remains noise next to the retries it avoids.
 
 STAGE_A_EMBEDDINGS_FALLBACK = "openrouter/openai/text-embedding-ada-002"
 # Deliberately the SAME vendor as the primary below, breaking this file's
@@ -186,13 +202,21 @@ EMBEDDING_DIM = 1536
 # rather than a declared capability flag. Re-run that eval and swap these
 # strings before this product is trusted with a real creator's channel.
 
-STAGE_B_CLASSIFY_FALLBACK = "openrouter/openai/gpt-oss-20b"
-# Paid, same reasoning as STAGE_A_SENTIMENT_FALLBACK. $0.030/$0.130 per M.
-# Different vendor (OpenAI) from the primary (Qwen), and no longer shared
-# with Stage A's fallback -- every stage now has a distinct backup, so no
-# single provider event can take out two stages' insurance at once.
+STAGE_B_CLASSIFY_FALLBACK = "openrouter/deepseek/deepseek-v3.2"
+# $0.269/$0.400 per M -- unusually cheap output pricing for its tier, which
+# suits Stage B's shape (large batched input, small JSON out). Different
+# vendor (DeepSeek) from the primary (OpenAI) and from every other stage's
+# fallback, so no single provider event can take out two stages' insurance
+# at once.
 
-STAGE_B_CLASSIFY = "openrouter/qwen/qwen3.7-flash"
+STAGE_B_CLASSIFY = "openrouter/openai/gpt-4.1-mini"
+# $0.400/$1.600 per M. Stage B is the judgement-heaviest of the batched
+# stages: is_request vs is_confusion are genuinely ambiguous calls that a
+# weak model collapses into "whatever the intent label was" (see the
+# prompt in engine/llm_client.py, which now spells out that they are
+# independent). It also sees only the Stage-A-flagged subset (~10-20% of
+# comments), so a higher unit price applies to a fraction of the volume --
+# roughly $0.007 on a 500-comment analysis.
 # Role: batched classification of the Stage-A-flagged subset (~10-20% of
 # comments, 40-60 per call) — intent / is_request / is_confusion. Paid, for
 # the third and last time this file has had to record the same lesson: the
@@ -208,14 +232,20 @@ STAGE_B_CLASSIFY = "openrouter/qwen/qwen3.7-flash"
 # supports_response_schema. Different vendor (Qwen) from Stage A's Mistral,
 # so one provider's capacity event can't stall both stages at once.
 
-STAGE_C_SYNTHESIS_FALLBACK = "openrouter/google/gemma-4-26b-a4b-it"
-# Paid, same reasoning as the other two fallbacks. $0.042/$0.220 per M --
-# the most capable of the three backups, deliberately: Stage C is the only
-# stage whose output a human reads, and a failure here wastes every
-# earlier stage's work. Different vendor (Google) from the primary
-# (DeepSeek).
+STAGE_C_SYNTHESIS_FALLBACK = "openrouter/openai/gpt-4.1-mini"
+# $0.400/$1.600 per M. A true peer of the primary, deliberately: Stage C
+# is the only stage whose output a human reads, and a failure here wastes
+# every earlier stage's completed work. Different vendor (OpenAI) from the
+# primary (Google).
 
-STAGE_C_SYNTHESIS = "openrouter/deepseek/deepseek-v4-flash-0731"
+STAGE_C_SYNTHESIS = "openrouter/google/gemini-2.5-flash"
+# $0.300/$2.500 per M, ~8 calls per analysis (~$0.014). SPEC §11 says
+# "pick Stage C on quality, price is noise at ~8 calls", and this stage
+# has the hardest constraint in the pipeline: every quote it returns is
+# checked character-by-character against the real comment corpus
+# (schemas.py's _validate_quotes_verbatim), and a single "tidied" quote
+# discards the whole insight block. Exact-copy discipline under a long
+# instruction is precisely what separates model tiers here.
 # Role: one call per cluster (capped at 8) producing an insight block and
 # selecting verbatim quotes. Paid, alongside Stage A/B -- at ~8 calls per
 # analysis the free tier's throttling risk was the lowest here, but it was
