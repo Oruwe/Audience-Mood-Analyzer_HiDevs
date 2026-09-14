@@ -38,7 +38,11 @@ def _fake_response(json_text: str) -> SimpleNamespace:
 def _valid_batch_json(comments: list[RawComment]) -> str:
     return json.dumps({
         "results": [
-            {"comment_id": c.id, "sentiment": "positive", "confidence": 0.8} for c in comments
+            # Positional aliases, not real ids: engine.batching.as_batch_payload
+            # sends "0".."N-1" and maps back locally, so a model never has to
+            # reproduce a 26-character opaque YouTube id character-perfectly.
+            {"comment_id": str(i), "sentiment": "positive", "confidence": 0.8}
+            for i, _c in enumerate(comments)
         ]
     })
 
@@ -87,7 +91,9 @@ def test_length_mismatch_splits_batch_and_retries(monkeypatch):
             return _fake_response(json.dumps({
                 "results": [{"comment_id": requested_ids[0], "sentiment": "neutral", "confidence": 0.5}]
             }))
-        matching = [c for c in comments if c.id in requested_ids]
+        # requested_ids are positional aliases for THIS sub-batch, so a
+        # well-behaved model simply echoes each one back.
+        matching = requested_ids
         return _fake_response(_valid_batch_json(matching))
 
     monkeypatch.setattr(batching, "acompletion", fake_acompletion)
@@ -143,7 +149,7 @@ def test_injection_cannot_produce_an_out_of_enum_sentiment(monkeypatch):
 
     async def fake_acompletion(**kwargs):
         return _fake_response(json.dumps({
-            "results": [{"comment_id": "c0", "sentiment": "DEFINITELY_HACKED", "confidence": 0.99}]
+            "results": [{"comment_id": "0", "sentiment": "DEFINITELY_HACKED", "confidence": 0.99}]
         }))
 
     monkeypatch.setattr(batching, "acompletion", fake_acompletion)
@@ -159,8 +165,9 @@ def test_classify_all_sentiments_batches_at_the_configured_size(monkeypatch):
         content = kwargs["messages"][1]["content"]
         n = len(json.loads(content))
         seen_batch_sizes.append(n)
-        batch = [c for c in comments if c.id in content]
-        return _fake_response(_valid_batch_json(batch))
+        # The payload carries positional aliases, so the real ids are not
+        # in `content` at all -- answer for exactly the n items asked for.
+        return _fake_response(_valid_batch_json(json.loads(content)))
 
     monkeypatch.setattr(batching, "acompletion", fake_acompletion)
     result = asyncio.run(

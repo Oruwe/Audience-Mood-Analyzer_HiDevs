@@ -34,7 +34,7 @@ def _comment(i: int) -> RawComment:
 def test_batching_retries_a_transient_litellm_error(monkeypatch):
     comments = [_comment(0)]
     valid_json = json.dumps({
-        "results": [{"comment_id": "c0", "sentiment": "positive", "confidence": 0.9}]
+        "results": [{"comment_id": "0", "sentiment": "positive", "confidence": 0.9}]
     })
     calls = {"count": 0}
 
@@ -127,7 +127,7 @@ def _bare_api_error(model: str) -> APIError:
 def test_batching_retries_a_bare_api_error_not_just_named_subclasses(monkeypatch):
     comments = [_comment(0)]
     valid_json = json.dumps({
-        "results": [{"comment_id": "c0", "sentiment": "positive", "confidence": 0.9}]
+        "results": [{"comment_id": "0", "sentiment": "positive", "confidence": 0.9}]
     })
     calls = {"count": 0}
 
@@ -152,7 +152,7 @@ def test_batching_retries_a_bare_api_error_not_just_named_subclasses(monkeypatch
 def test_batching_falls_back_on_a_bare_api_error_from_the_primary(monkeypatch):
     calls = {"model-a": 0, "model-b": 0}
     valid_json = json.dumps({
-        "results": [{"comment_id": "c0", "sentiment": "positive", "confidence": 0.9}]
+        "results": [{"comment_id": "0", "sentiment": "positive", "confidence": 0.9}]
     })
 
     async def fake_acompletion(*, model, **kwargs):
@@ -186,7 +186,7 @@ def test_batching_falls_back_immediately_on_a_not_found_error_without_retrying_i
     """
     calls = {"model-a": 0, "model-b": 0}
     valid_json = json.dumps({
-        "results": [{"comment_id": "c0", "sentiment": "positive", "confidence": 0.9}]
+        "results": [{"comment_id": "0", "sentiment": "positive", "confidence": 0.9}]
     })
 
     async def fake_acompletion(*, model, **kwargs):
@@ -256,7 +256,7 @@ def test_batching_falls_back_immediately_on_a_rate_limit_without_retrying_it(mon
     """
     comments = [_comment(0)]
     valid_json = json.dumps({
-        "results": [{"comment_id": "c0", "sentiment": "positive", "confidence": 0.9}]
+        "results": [{"comment_id": "0", "sentiment": "positive", "confidence": 0.9}]
     })
     calls = {"model-a": 0, "model-b": 0}
 

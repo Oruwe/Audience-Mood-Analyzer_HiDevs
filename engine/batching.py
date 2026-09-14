@@ -95,30 +95,34 @@ async def _call_model_with_fallback(
 
 
 def as_batch_payload(comments: list[RawComment]) -> str:
-    """Serialise a batch as a JSON array, not one `id: text` line each.
+    """Serialise a batch as a JSON array using SHORT POSITIONAL ids.
 
-    The line-per-comment format this used to send was ambiguous, and the
-    ambiguity was expensive. ingestion/normalizer.py deliberately PRESERVES
-    newlines inside comment text (they carry meaning, and Stage C's
-    verbatim-quote validator compares against the stored text exactly), so
-    a comment containing a line break became several lines in the prompt,
-    with the continuation lines carrying no `id:` prefix. The model then
-    could not tell where one comment ended and the next began, and
-    returned the wrong number of results -- tripping the §4.1b guard.
+    Two separate failure modes drove this, both measured in production
+    rather than reasoned about:
 
-    Splitting could not repair that: the multi-line comment is still
-    multi-line in each half, so one offending comment cascaded a 28-item
-    batch down through 14, 7, ... to single-item batches, each level a
-    fresh sequential model call. Observed live (2026-09-14) as the single
-    biggest contributor to a 90s analysis, and it explains why upgrading
-    models never silenced the mismatch warnings -- the fault was in this
-    payload, not in any model.
+    1. The original format was one `<id>: <text>` line per comment. But
+       ingestion/normalizer.py deliberately preserves newlines inside
+       comment text, so a comment containing a line break became several
+       lines with no id prefix on the continuations, and the model could
+       not tell where one comment ended. JSON escapes the newlines, which
+       fixes that.
 
-    JSON escapes the newlines, so structure is unambiguous while the text
-    the model receives (and must quote back verbatim) stays byte-identical.
+    2. Far more damaging: real YouTube comment ids look like
+       `UgxKREWxIgQ7mZlbUZ14AaABAg` -- 26+ opaque characters. The §4.1b
+       guard requires the returned id SET to match exactly, so a batch of
+       50 asked a model to reproduce 50 such strings character-perfectly,
+       and a single wrong character anywhere failed the entire batch into
+       a split. That is a coin-flip dressed up as a contract. It also
+       explains why harness/preflight.py stayed green while production
+       cascaded: the probe used friendly ids like `probe-0-Zx09`.
+
+    So the model never sees a real id. It sees "0", "1", "2", ... and
+    echoes those back -- trivially reliable -- and
+    `run_batched_llm_classification` maps them to real ids locally, where
+    the mapping cannot be got wrong. Fewer tokens, too.
     """
     return json.dumps(
-        [{"comment_id": c.id, "text": c.text} for c in comments],
+        [{"comment_id": str(i), "text": c.text} for i, c in enumerate(comments)],
         ensure_ascii=False,
     )
 
@@ -160,11 +164,18 @@ async def run_batched_llm_classification(
     )
     parsed = _parse(response.choices[0].message.content, response_schema)
 
-    expected_ids = {c.id for c in comments}
+    # The model answers in positional aliases ("0".."N-1"); the real ids
+    # never left this process. See as_batch_payload for why.
+    real_id_by_alias = {str(i): c.id for i, c in enumerate(comments)}
     if parsed is not None and len(parsed.results) == len(comments):
-        got_ids = {item.comment_id for item in parsed.results}
-        if got_ids == expected_ids:
-            return {item.comment_id: item for item in parsed.results}
+        got_aliases = {item.comment_id for item in parsed.results}
+        if got_aliases == set(real_id_by_alias):
+            return {
+                real_id_by_alias[item.comment_id]: item.model_copy(
+                    update={"comment_id": real_id_by_alias[item.comment_id]}
+                )
+                for item in parsed.results
+            }
 
     # SPEC §4.1b: "On mismatch, split the batch in half and retry."
     if len(comments) == 1:

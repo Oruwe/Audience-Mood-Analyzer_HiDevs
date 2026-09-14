@@ -33,8 +33,10 @@ def _fake_response(json_text: str) -> SimpleNamespace:
 def _valid_batch_json(comments: list[RawComment]) -> str:
     return json.dumps({
         "results": [
-            {"comment_id": c.id, "intent": "request", "is_request": True, "is_confusion": False}
-            for c in comments
+            # Positional aliases -- see engine.batching.as_batch_payload.
+            {"comment_id": str(i), "intent": "request", "is_request": True,
+             "is_confusion": False}
+            for i, _c in enumerate(comments)
         ]
     })
 
@@ -81,7 +83,9 @@ def test_length_mismatch_splits_batch_and_retries(monkeypatch):
                 "results": [{"comment_id": requested_ids[0], "intent": "other",
                              "is_request": False, "is_confusion": False}]
             }))
-        matching = [c for c in comments if c.id in requested_ids]
+        # requested_ids are positional aliases for THIS sub-batch, so a
+        # well-behaved model simply echoes each one back.
+        matching = requested_ids
         return _fake_response(_valid_batch_json(matching))
 
     monkeypatch.setattr(batching, "acompletion", fake_acompletion)
@@ -117,8 +121,9 @@ def test_classify_all_batches_at_the_configured_size(monkeypatch):
         content = kwargs["messages"][1]["content"]
         n = len(json.loads(content))
         seen_batch_sizes.append(n)
-        batch = [c for c in comments if c.id in content]
-        return _fake_response(_valid_batch_json(batch))
+        # The payload carries positional aliases, so the real ids are not
+        # in `content` at all -- answer for exactly the n items asked for.
+        return _fake_response(_valid_batch_json(json.loads(content)))
 
     monkeypatch.setattr(batching, "acompletion", fake_acompletion)
     result = asyncio.run(llm_client.classify_all(comments, api_key=API_KEY, batch_size=4))

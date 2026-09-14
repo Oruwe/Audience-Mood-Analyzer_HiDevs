@@ -214,12 +214,18 @@ def test_embeddings_check_passes_on_the_declared_width():
 
 
 def test_chat_probe_fails_when_a_model_does_not_echo_ids_exactly(monkeypatch):
-    """A model that renumbers ids passes JSON-schema validation and still
-    corrupts the pipeline, because results are matched by comment_id."""
+    """A model that returns ids the caller never sent still passes JSON
+    schema validation, and would corrupt the pipeline because results are
+    matched by comment_id.
+
+    Note the shape of "wrong" changed with positional aliases: echoing
+    "0"/"1" is now the CORRECT answer for a 2-item batch, so this returns
+    aliases outside the requested range to express the same failure.
+    """
     async def renumbering_acompletion(*, model, **kwargs):
         payload = json.dumps({"results": [
-            {"comment_id": "0", "sentiment": "positive", "confidence": 0.9},
-            {"comment_id": "1", "sentiment": "neutral", "confidence": 0.8},
+            {"comment_id": "98", "sentiment": "positive", "confidence": 0.9},
+            {"comment_id": "99", "sentiment": "neutral", "confidence": 0.8},
         ]})
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=payload))])
 

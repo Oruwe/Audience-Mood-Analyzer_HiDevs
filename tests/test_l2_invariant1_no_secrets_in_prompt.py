@@ -20,7 +20,7 @@ import engine.llm_client as llm_client
 from schemas import RawComment
 
 _VALID_BATCH_JSON = json.dumps({
-    "results": [{"comment_id": "c1", "intent": "praise", "is_request": False, "is_confusion": False}]
+    "results": [{"comment_id": "0", "intent": "praise", "is_request": False, "is_confusion": False}]
 })
 
 
