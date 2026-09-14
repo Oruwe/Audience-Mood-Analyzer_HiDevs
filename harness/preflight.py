@@ -132,21 +132,48 @@ class PreflightReport:
         return not self.failed and not self.skipped
 
 
-def _probe_comments(n: int = 2) -> list[RawComment]:
-    """Synthetic comments with deliberately awkward ids.
+# Shaped like real YouTube comment ids -- 26 opaque base64-ish characters,
+# which is what ingestion actually hands the engine. See _probe_comments.
+_PROBE_IDS = (
+    "UgxKREWxIgQ7mZlbUZ14AaABAg",
+    "UgyH2n0pTfLk9dQ8wRt4AaABAg",
+    "Ugw7bVqXjM3sNcP1eLY4AaABAg",
+    "UgzR4mKdFvB6tXhA0wQ4AaABAg",
+)
 
-    The ids are not `c0`/`c1`: a model that renumbers, truncates, or
-    "tidies" ids is the exact failure the §4.1b guard catches in
-    production, and a probe using trivial ids wouldn't provoke it.
+
+def _probe_comments(n: int = 2) -> list[RawComment]:
+    """Synthetic comments shaped exactly like production input.
+
+    This function had a blind spot that cost a live outage. It used to
+    build friendly ids (`probe-0-Zx09`) and single-line texts, so every
+    check here stayed green while production cascaded into split-and-retry
+    on every batch. The harness was certifying an easier task than the one
+    the system actually does -- the worst failure mode a diagnostic has,
+    because it turns an outage into a mystery.
+
+    So the probes now carry the two properties real input has and the old
+    ones didn't:
+
+    1. 26-character opaque ids, the shape ingestion really produces. Since
+       engine/batching.py moved to positional aliases the model never sees
+       these, which is the point: the probe exercises the alias -> real-id
+       mapping on ids that would have broken the old format, and would go
+       red again if anything ever put real ids back on the wire.
+    2. A comment containing a line break. Multi-line text is ordinary in a
+       comment section, and it is what broke the original line-oriented
+       payload format; JSON encoding is what fixed it, and this keeps that
+       fix under test against the live provider.
     """
     texts = [
         "this finally made sense to me, thank you!!",
-        "wait what happened at 4:32, mine throws an error there",
+        "wait what happened at 4:32\nmine throws an error right there",
         "please do a part 2 on the deployment side",
     ]
     return [
         RawComment(
-            id=f"probe-{i}-Zx{i}9", platform="youtube", text=texts[i % len(texts)],
+            id=_PROBE_IDS[i % len(_PROBE_IDS)], platform="youtube",
+            text=texts[i % len(texts)],
             timestamp=datetime.now(timezone.utc), video_id="probe-video",
         )
         for i in range(n)

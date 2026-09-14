@@ -463,7 +463,15 @@ def _render_eval_section() -> None:
                 else:
                     st.rerun()
 
-        metrics = _run_async(load_latest_eval())
+        # A read for an optional diagnostics panel must never decide whether
+        # the product renders. Unguarded, one unreachable Postgres turned the
+        # whole page into a stack trace -- no URL box, no way to do the thing
+        # the app is for, over a panel nobody had opened.
+        try:
+            metrics = _run_async(load_latest_eval())
+        except Exception as exc:  # noqa: BLE001 -- diagnostics degrade, never crash
+            st.warning(f"Couldn't read the last benchmark result: {exc}")
+            return
         if metrics is None:
             st.caption("Not run yet in this deployment — click above for a live result.")
             return
@@ -612,7 +620,18 @@ def _start_new_analysis(channel_ref: str) -> None:
 
 
 def _render_job(job_id: str) -> None:
-    progress = _run_async(load_progress(job_id))
+    # This runs every POLL_INTERVAL_MS for as long as a job is on screen, so
+    # it is the call most exposed to a momentary Postgres blip -- and the
+    # worst place to raise: the job itself is fine, running in its own
+    # thread, and crashing the render is what would lose the user's only
+    # handle on it. Report and let the next poll try again.
+    try:
+        progress = _run_async(load_progress(job_id))
+    except Exception as exc:  # noqa: BLE001 -- a poll failure is not a job failure
+        logger.warning("Progress poll failed for job %s: %s", job_id, exc)
+        st.info("Still working — the progress read hiccuped, retrying…")
+        st_autorefresh(interval=POLL_INTERVAL_MS, key=f"poll_{job_id}")
+        return
     if progress is None:
         st.error("Lost track of that analysis — please start a new one.")
         return
