@@ -32,14 +32,11 @@ import os
 import re
 from typing import Literal
 
-import altair as alt
 import httpx
-import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
 import config.models as models
-import evals.benchmark as benchmark
 from harness.preflight import format_report, run_preflight
 from ingestion.youtube import (
     QuotaEstimate,
@@ -78,6 +75,40 @@ from storage.postgres import (
 # missing. `load_dotenv` does NOT override variables that are already set, so
 # on Render -- where the platform supplies the real values -- this is a no-op.
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Lazy imports: altair, pandas and evals.benchmark are NOT imported at module
+# scope, and that is load-bearing rather than tidiness.
+#
+# This service runs on 512 MiB. Importing app.py used to cost 404 MB before a
+# single comment was fetched -- litellm ~195 MB, scikit-learn ~180 MB, pandas
+# ~89 MB, altair ~40 MB -- leaving barely 100 MB for the actual work. The
+# result was an OOM kill mid-analysis: memory climbed to the 512 MiB ceiling
+# and the process was restarted, taking the background worker with it and
+# leaving the page on "Working…" forever (measured 2026-09-14, two kills at
+# 03:57:30 and 04:02:00, memory_usage 536,768,500 against a 536,870,900
+# limit).
+#
+# None of these three is needed to RUN an analysis. They are needed to draw
+# charts and to run the benchmark panel -- work that happens after the
+# expensive part is over, or only when someone opens a diagnostics expander.
+# Deferring them keeps that memory out of the process during the window where
+# the ceiling actually gets hit. Python caches the import afterwards, so the
+# cost is paid once, at the point it buys something.
+# ---------------------------------------------------------------------------
+
+def _benchmark_dataset():
+    """The eval dataset, imported on first use. See the note above."""
+    import evals.benchmark as benchmark
+    return benchmark.load_dataset()
+
+
+def _charting():
+    """Return (altair, pandas), imported on first use. See the note above."""
+    import altair as alt
+    import pandas as pd
+    return alt, pd
+
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +316,8 @@ async def run_and_persist_eval() -> dict:
     OPENROUTER_API_KEY this process is already running with -- and persist
     the result to Postgres so it survives a page reload or a restart.
     """
+    import evals.benchmark as benchmark  # lazy: ~180 MB of sklearn.metrics
+
     metrics = await benchmark.run_benchmark(persist_to_file=False)
     async with connect() as conn:
         await init_schema(conn)
@@ -298,10 +331,11 @@ async def load_latest_eval() -> dict | None:
         return await get_latest_eval_run(conn)
 
 
-def confusion_matrix_chart(cm: list[list[int]], labels: list[str]) -> alt.LayerChart:
+def confusion_matrix_chart(cm: list[list[int]], labels: list[str]) -> "alt.LayerChart":
     """A labeled heatmap (rows=actual, cols=predicted) over evals/benchmark.
     py's 3-class confusion matrix -- Altair ships with Streamlit already, no
     new dependency."""
+    alt, pd = _charting()
     rows = [
         {"actual": labels[i], "predicted": labels[j], "count": cm[i][j]}
         for i in range(len(labels))
@@ -322,7 +356,8 @@ def confusion_matrix_chart(cm: list[list[int]], labels: list[str]) -> alt.LayerC
     return (heat + text).properties(width=280, height=280)
 
 
-def sentiment_distribution_chart(counts: dict[str, int]) -> alt.Chart:
+def sentiment_distribution_chart(counts: dict[str, int]) -> "alt.Chart":
+    alt, pd = _charting()
     df = pd.DataFrame(
         [{"sentiment": label, "count": counts.get(label, 0)} for label in _SENTIMENT_ORDER]
     )
@@ -339,7 +374,8 @@ def sentiment_distribution_chart(counts: dict[str, int]) -> alt.Chart:
     )
 
 
-def stage_duration_chart(durations: dict[str, float]) -> alt.Chart:
+def stage_duration_chart(durations: dict[str, float]) -> "alt.Chart":
+    alt, pd = _charting()
     df = pd.DataFrame(
         [
             {"stage": _STAGE_CHART_LABELS.get(stage, stage), "seconds": seconds}
@@ -438,7 +474,7 @@ def _render_preflight_section() -> None:
 
         icons = {"PASS": "✅", "FAIL": "❌", "WARN": "⚠️", "SKIP": "⏭️"}
         st.dataframe(
-            pd.DataFrame(
+            _charting()[1].DataFrame(
                 [
                     {
                         "": icons.get(r.status, ""),
@@ -462,7 +498,7 @@ def _render_eval_section() -> None:
     set (evals/test_dataset.json), not a claimed/static figure."""
     with st.expander("📊 Model accuracy benchmark (live)"):
         st.caption(
-            f"Runs all {len(benchmark.load_dataset())} hand-labeled comments in "
+            f"Runs all {len(_benchmark_dataset())} hand-labeled comments in "
             "evals/test_dataset.json through the live Stage A sentiment model "
             "and scores it — a real confusion matrix, not a claimed number."
         )
@@ -514,7 +550,7 @@ def _render_eval_section() -> None:
                 for label, stats in report.items()
                 if label in metrics["labels"]
             ]
-            st.dataframe(pd.DataFrame(rows).set_index("label"), width="stretch")
+            st.dataframe(_charting()[1].DataFrame(rows).set_index("label"), width="stretch")
 
 
 @st.cache_resource(show_spinner=False)

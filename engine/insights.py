@@ -31,10 +31,10 @@ import numpy as np
 import openai
 from litellm import acompletion
 from pydantic import BaseModel, ValidationError
-from sklearn.cluster import KMeans
 
 from config.models import STAGE_C_SYNTHESIS, STAGE_C_SYNTHESIS_FALLBACK
 from engine.batching import as_batch_payload
+from engine.clustering import kmeans_labels
 from resilience import is_fallback_worthy_api_error, retry_transient_api_error
 from schemas import (
     ChannelInsights,
@@ -198,7 +198,7 @@ def _cluster_comments(
         return []
     k = _cluster_count(len(usable), max_clusters)
     matrix = np.array([embeddings[c.id] for c in usable], dtype=float)
-    labels = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(matrix)
+    labels = kmeans_labels(matrix, k, n_init=10, random_state=0)
     groups: dict[int, list[RawComment]] = {}
     for comment, label in zip(usable, labels):
         groups.setdefault(int(label), []).append(comment)

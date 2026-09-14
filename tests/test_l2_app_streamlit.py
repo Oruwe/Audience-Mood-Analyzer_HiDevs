@@ -169,3 +169,41 @@ def test_progress_polling_uses_a_native_fragment_not_a_custom_component():
 def test_streamlit_autorefresh_is_not_a_declared_dependency():
     requirements = (APP_PATH.parent / "requirements.txt").read_text(encoding="utf-8")
     assert "streamlit-autorefresh" not in requirements
+
+
+# ---------------------------------------------------------------------------
+# Memory. This service has 512 MiB and importing app.py used to consume 404 MB
+# of it before fetching a single comment — litellm ~195 MB, scikit-learn
+# ~180 MB, pandas ~89 MB, altair ~40 MB. The process was OOM-killed twice
+# mid-analysis (2026-09-14, 03:57:30 and 04:02:00: memory_usage 536,768,500
+# against a 536,870,900 limit), taking the background worker with it and
+# leaving the page on "Working…" indefinitely.
+#
+# A unit test cannot assert an RSS figure portably, but it can assert the
+# thing that caused it: which modules are resident after importing the app.
+# Each name below is deferred on purpose and none is needed to RUN an
+# analysis. Re-adding a module-level import of any of them puts ~180 MB back
+# on a budget that has no room for it.
+# ---------------------------------------------------------------------------
+
+def test_the_heavy_optional_dependencies_are_not_imported_at_module_scope():
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys, app; "
+        "print(','.join(m for m in ('sklearn','scipy','altair','pandas','evals.benchmark') "
+        "if m in sys.modules))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True,
+        cwd=str(APP_PATH.parent),
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    leaked = result.stdout.strip()
+    assert not leaked, (
+        f"these are resident just from importing app.py: {leaked}. They cost "
+        "~180 MB (sklearn) / ~89 MB (pandas) / ~40 MB (altair) on a 512 MiB "
+        "instance and none is needed to run an analysis — import them inside "
+        "the function that uses them."
+    )

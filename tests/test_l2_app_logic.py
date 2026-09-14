@@ -202,7 +202,12 @@ def test_run_and_persist_eval_persists_a_stubbed_benchmark_result(pg_dsn, monkey
         assert persist_to_file is False
         return {"accuracy": 0.75, "generated_at": "test-time"}
 
-    monkeypatch.setattr(app.benchmark, "run_benchmark", fake_run_benchmark)
+    # app.py imports evals.benchmark lazily (it drags in scikit-learn, which
+    # does not fit in this service's 512 MiB alongside everything else), so
+    # there is no `app.benchmark` attribute to patch — patch the module the
+    # lazy import will resolve to.
+    import evals.benchmark as benchmark
+    monkeypatch.setattr(benchmark, "run_benchmark", fake_run_benchmark)
 
     async def scenario():
         conn = await asyncpg.connect(pg_dsn)

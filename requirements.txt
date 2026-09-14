@@ -26,7 +26,12 @@ streamlit               # app.py -- the only entrypoint
 altair>=5.0             # mood distribution, confusion matrix, stage timing
 pandas>=2.2.2           # dataframes behind those charts
 numpy>=2.1              # embedding vectors, sentiment arithmetic
-scikit-learn>=1.5       # KMeans (stage filter + Stage C clustering), eval metrics
+scikit-learn>=1.5       # evals/benchmark.py ONLY — accuracy + confusion matrix.
+                        # Deliberately NOT on the analysis path: importing it costs
+                        # ~180 MB resident, and this service has 512 MiB total. The
+                        # clustering it used to provide is engine/clustering.py now.
+                        # app.py imports evals.benchmark lazily so this stays out of
+                        # memory unless someone opens the benchmark panel.
 
 # Dev / CI. Installed in production too, deliberately: the same `pytest` run
 # works on the deployed box, which has been worth having.

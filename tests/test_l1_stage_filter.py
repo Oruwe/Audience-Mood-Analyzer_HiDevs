@@ -28,25 +28,28 @@ def _sentiment(comment_id: str, sentiment: Sentiment, confidence: float) -> Stag
 
 
 def _stub_kmeans(monkeypatch, labels: list[int]):
-    """Replace KMeans with a stub that returns a fixed label array,
-    regardless of k/n_init/random_state or the actual embedding values."""
+    """Replace the clusterer with a stub returning a fixed label array,
+    regardless of k/n_init/random_state or the actual embedding values.
 
-    class _StubKMeans:
-        def __init__(self, **kwargs):
-            pass
+    Patches `kmeans_labels` (engine/clustering.py) rather than scikit-learn's
+    `KMeans`: the clusterer was reimplemented over numpy because importing
+    scikit-learn cost ~180 MB on a 512 MiB instance and was OOM-killing the
+    process mid-analysis. These tests are about the filter's promotion rules,
+    not about who computes the clusters, so they stub the same seam either
+    way."""
 
-        def fit_predict(self, matrix):
-            assert len(matrix) == len(labels)
-            return np.array(labels)
+    def _stub(matrix, n_clusters, **kwargs):
+        assert len(matrix) == len(labels)
+        return np.array(labels)
 
-    monkeypatch.setattr(stage_filter, "KMeans", _StubKMeans)
+    monkeypatch.setattr(stage_filter, "kmeans_labels", _stub)
 
 
 def _forbid_kmeans(monkeypatch):
-    def _boom(**kwargs):
-        raise AssertionError("KMeans should not be instantiated for < 2 comments")
+    def _boom(*args, **kwargs):
+        raise AssertionError("clustering should not run for < 2 comments")
 
-    monkeypatch.setattr(stage_filter, "KMeans", _boom)
+    monkeypatch.setattr(stage_filter, "kmeans_labels", _boom)
 
 
 @pytest.mark.parametrize("n,expected_k", [

@@ -32,7 +32,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 import numpy as np
-from sklearn.cluster import KMeans
+
+from engine.clustering import kmeans_labels
 
 from schemas import RawComment, Sentiment, StageASentimentItem
 
@@ -96,7 +97,7 @@ def flag_comments(
         ids = [c.id for c in comments]
         matrix = np.array([embeddings[i] for i in ids], dtype=float)
         k = _cluster_count(len(comments))
-        labels = KMeans(n_clusters=k, n_init=10, random_state=random_state).fit_predict(matrix)
+        labels = kmeans_labels(matrix, k, n_init=10, random_state=random_state)
         cluster_sizes = np.bincount(labels)
         for comment_id, label in zip(ids, labels):
             if cluster_sizes[label] >= dense_cluster_min_size:

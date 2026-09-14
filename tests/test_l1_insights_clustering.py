@@ -1,8 +1,11 @@
 """L1 unit tests — engine.insights's clustering helpers.
 
-KMeans is stubbed (fixed label arrays), same approach as
+The clusterer is stubbed (fixed label arrays), same approach as
 tests/test_l1_stage_filter.py: these test *our* grouping/ordering/
-size-filtering logic, not scikit-learn's clustering quality.
+size-filtering logic, not the clustering quality underneath it. That seam
+moved from scikit-learn's KMeans to engine.clustering.kmeans_labels when
+scikit-learn's ~180 MB import turned out to be OOM-killing a 512 MiB
+instance; these tests are indifferent to which one computes the labels.
 """
 
 from datetime import datetime, timezone
@@ -23,15 +26,11 @@ def _comment(i: int) -> RawComment:
 
 
 def _stub_kmeans(monkeypatch, labels: list[int]):
-    class _StubKMeans:
-        def __init__(self, **kwargs):
-            pass
+    def _stub(matrix, n_clusters, **kwargs):
+        assert len(matrix) == len(labels)
+        return np.array(labels)
 
-        def fit_predict(self, matrix):
-            assert len(matrix) == len(labels)
-            return np.array(labels)
-
-    monkeypatch.setattr(insights, "KMeans", _StubKMeans)
+    monkeypatch.setattr(insights, "kmeans_labels", _stub)
 
 
 @pytest.mark.parametrize("n,max_clusters,expected_k", [

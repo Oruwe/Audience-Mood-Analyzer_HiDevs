@@ -512,7 +512,7 @@ pytest -k invariant                 # just the security contract tests
 python -m evals.benchmark           # live sentiment accuracy + confusion matrix
 ```
 
-**279 passing, 1 skipped** with a database reachable (234 passing, 46 skipped
+**290 passing, 1 skipped** with a database reachable (245 passing, 46 skipped
 without one — the skips are the Postgres integration tests, which enable
 themselves as soon as `DATABASE_URL` points at a live database). The single
 test that stays skipped either way is invariant 5 (see below).
@@ -622,6 +622,11 @@ Stated plainly, because a README that only lists strengths is not useful.
   would be worth running.
 - **Cluster counts and filter thresholds are documented starting points**, not
   measured optima. There is no labelled channel data to tune them against yet.
+- **Memory is the binding constraint, not CPU.** The service has 512 MiB and
+  importing the app alone costs ~233 MB (litellm ~195 MB of it). That is why
+  scikit-learn was replaced with `engine/clustering.py` and why altair, pandas
+  and the eval module are imported lazily. There is headroom now, but not a
+  lot — a large channel's embeddings are the next thing that would eat it.
 - **Single-user, no auth.** Queries are written to be `user_id`-scoped and the
   tenant-isolation test is already in the tree, but it skips: there is no auth
   layer for it to test against yet.
@@ -650,6 +655,7 @@ engine/
   stage_filter.py         The three promotion criteria
   llm_client.py           Stage B classification
   insights.py             Stage C synthesis, clustering, quote selection
+  clustering.py           k-means in numpy — scikit-learn did not fit in 512 MiB
   batching.py             The split-and-retry guard, shared by A and B
 
 storage/postgres.py       Jobs, batches, checkpoints, cache, heartbeat, reaper
