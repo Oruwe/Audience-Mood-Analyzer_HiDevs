@@ -5,6 +5,7 @@ model string appears anywhere else in the codebase — that's a testable
 rule." This test is that rule.
 """
 
+import re
 from pathlib import Path
 
 from config import models
@@ -75,3 +76,46 @@ def test_embedding_dim_matches_stage_a_embedder():
         # Unrecognised embedder swapped in — at minimum the dimension must be
         # a sane positive integer someone deliberately set.
         assert isinstance(models.EMBEDDING_DIM, int) and models.EMBEDDING_DIM > 0
+
+
+# ---------------------------------------------------------------------------
+# The gap the test above leaves open.
+#
+# `test_model_strings_appear_only_in_config_models` greps for the CURRENT
+# values of the constants, so it only enforces the boundary for whatever
+# config/models.py happens to name today. A stale slug from a provider this
+# project no longer uses sails straight past it -- which is exactly what
+# happened: three leftover debug scripts sat in the repo root hardcoding
+# `groq/openai/gpt-oss-20b` and `gemini/gemini-3.6-flash` long after both
+# providers were dropped. Nothing failed, and anyone running them to check
+# their setup would have seen two errors and concluded their keys were bad.
+#
+# So this one matches the *shape* of a provider slug rather than a list of
+# known values, over production code only. Tests legitimately name models --
+# placeholder slugs for routing assertions, and the dimension registry above.
+# ---------------------------------------------------------------------------
+
+_PROVIDER_SLUG = re.compile(
+    r"""["'](?:openrouter|gemini|groq|openai|anthropic|mistralai|deepseek"""
+    r"""|google|qwen|meta-llama|cohere|perplexity|xai)/[A-Za-z0-9._:-]+"""
+    r"""(?:/[A-Za-z0-9._:-]+)?["']"""
+)
+
+
+def test_no_model_shaped_literal_survives_in_production_code():
+    offenders: list[str] = []
+    for path in _repo_python_files():
+        if "tests" in path.parts:
+            continue
+        for lineno, line in enumerate(
+            path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
+        ):
+            for hit in _PROVIDER_SLUG.findall(line):
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: {hit}")
+    assert not offenders, (
+        "Model-shaped string literal(s) outside config/models.py. Every model "
+        "this project names lives there and nowhere else (SPEC §11.1), "
+        "including ones no longer in use — a stale slug in a helper script is "
+        "worse than a live one, because it fails in a way that looks like the "
+        "user's fault:\n" + "\n".join(offenders)
+    )

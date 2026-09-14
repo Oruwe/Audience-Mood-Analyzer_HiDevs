@@ -63,6 +63,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import httpx
+from dotenv import load_dotenv
 
 import config.models as models
 from engine.batching import run_batched_llm_classification
@@ -539,6 +540,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     args = parser.parse_args(argv)
+
+    # Same reason app.py calls this: run from a clone, the keys live in a
+    # .env the README tells you to create, and nothing used to read it. A
+    # preflight that reports three missing keys because it never looked in
+    # the documented place is exactly the false alarm this module exists to
+    # prevent. Does not override variables the environment already sets.
+    load_dotenv()
 
     report = asyncio.run(run_preflight(offline=args.offline))
 

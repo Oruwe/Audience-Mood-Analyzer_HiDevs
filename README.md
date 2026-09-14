@@ -512,7 +512,7 @@ pytest -k invariant                 # just the security contract tests
 python -m evals.benchmark           # live sentiment accuracy + confusion matrix
 ```
 
-**231 passing, 44 skipped.** Almost all the skips are Postgres integration
+**232 passing, 44 skipped.** Almost all the skips are Postgres integration
 tests, which run automatically as soon as `DATABASE_URL` points at a reachable
 database; the one that stays skipped either way is invariant 5 (see below).
 

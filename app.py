@@ -35,6 +35,7 @@ import altair as alt
 import httpx
 import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
 
 import config.models as models
@@ -70,6 +71,13 @@ from storage.postgres import (
     reap_stale_jobs,
     save_eval_run,
 )
+
+# Local development reads its keys from a .env file; the README's setup
+# instructions have always said to create one. Nothing ever loaded it, so a
+# fresh clone followed the documented steps and was told all three keys were
+# missing. `load_dotenv` does NOT override variables that are already set, so
+# on Render -- where the platform supplies the real values -- this is a no-op.
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
