@@ -1,26 +1,38 @@
-# AI & Orchestration
-litellm
-instructor
-pydantic
-python-dotenv
+# Runtime
+#
+# Every entry below is imported by code that runs in production. Four
+# packages were removed once they turned out not to be: `instructor` and
+# `langfuse` (CONVENTIONS.md names both, but no module imports either and no
+# LLM callback is wired -- listing langfuse under an "Observability" heading
+# advertised tracing this project does not actually do), `pytz` (nothing
+# imports it; the stdlib `zoneinfo` is what ingestion/youtube.py uses). `scipy`
+# went too -- scikit-learn pulls it in regardless, so pinning it here only
+# implied a direct dependency that does not exist.
+#
+# `python-dotenv` was very nearly removed alongside them and then earned its
+# place: nothing imported it, but that was the bug, not the justification.
+# This repo ships a .env.example, gitignores .env, and the README tells you to
+# copy one to the other -- and no code ever loaded the result, so the
+# documented local setup reported all three keys missing.
 
-# Ingestion & Async
-websockets>=12.0
+litellm                 # OpenRouter routing for Stage A/B/C
+pydantic                # every schema and contract in the project
+tenacity                # resilience.py's backoff + jitter
+asyncpg                 # storage/postgres.py
+httpx>=0.27             # YouTube API, OpenRouter embeddings, preflight probes
+python-dotenv           # loads .env for local dev; a no-op where the host sets real env vars
 
-# Storage & Observability
-duckdb
-pytz>=2024.1
-langfuse
+streamlit               # app.py -- the only entrypoint
+altair>=5.0             # mood distribution, confusion matrix, stage timing
+pandas>=2.2.2           # dataframes behind those charts
+numpy>=2.1              # embedding vectors, sentiment arithmetic
+scikit-learn>=1.5       # evals/benchmark.py ONLY — accuracy + confusion matrix.
+                        # Deliberately NOT on the analysis path: importing it costs
+                        # ~180 MB resident, and this service has 512 MiB total. The
+                        # clustering it used to provide is engine/clustering.py now.
+                        # app.py imports evals.benchmark lazily so this stays out of
+                        # memory unless someone opens the benchmark panel.
 
-# UI & Evals
-streamlit
-streamlit-autorefresh
-pandas>=2.2.2
-numpy>=2.1
-scipy>=1.14
-scikit-learn>=1.5
-
-# V2 API layer
-fastapi>=0.115
-uvicorn[standard]>=0.30
-httpx>=0.27
+# Dev / CI. Installed in production too, deliberately: the same `pytest` run
+# works on the deployed box, which has been worth having.
+pytest

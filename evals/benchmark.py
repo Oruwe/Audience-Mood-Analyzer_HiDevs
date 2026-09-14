@@ -1,22 +1,36 @@
-"""Node 5 — Evaluation layer.
+"""SPEC §11 Track 1 — Stage A sentiment accuracy benchmark.
 
-Runs every case in evals/test_dataset.json through the production router
-(engine.llm_client.analyze_comment), scores sentiment detection with a lenient
-3-class scheme (strict accuracy on positive/neutral/negative; 'mixed' ground
-truth counts as correct when the model predicts either polarity), prints a
-classification report, and persists raw metrics to data/eval_metrics.json for
-the Streamlit dashboard.
+Runs every case in evals/test_dataset.json through Stage A's sentiment
+classifier (engine.stage_a.classify_all_sentiments), scores with the same
+lenient 3-class scheme this file has always used (strict accuracy on
+positive/neutral/negative; 'mixed' ground truth counts as correct when the
+model predicts either polarity), prints a classification report, and
+persists metrics to data/eval_metrics.json (SPEC §6: "commit the output").
+
+Rewritten for the §4.1 amendment (config/models.py): Stage A now classifies
+via OpenRouter, batched, not the old one-comment-per-call local/Gemini
+router (engine.llm_client.analyze_comment no longer exists — that name is
+now Stage B's batched classify_batch/classify_all, a different job
+entirely). Needs OPENROUTER_API_KEY. Batching also means the old
+MAX_CONCURRENCY/STAGGER_SECONDS free-tier throttling is gone: this dataset
+is 1-2 sentiment batches now, not 30 individual rate-limited calls.
 
 Usage (from repo root):
     python -m evals.benchmark
+
+Also importable and callable directly with `persist_to_file=False` — app.py's
+"Model accuracy benchmark" panel does exactly this, running the same real
+benchmark against the live deployed model on demand and persisting the
+result to Postgres (storage.postgres.save_eval_run) instead of a file, so
+it survives a redeploy/restart the same way SPEC §8 job state already does.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,24 +44,14 @@ from sklearn.metrics import (  # noqa: E402
     confusion_matrix,
 )
 
-from engine.llm_client import analyze_comment  # noqa: E402
+from engine.stage_a import classify_all_sentiments  # noqa: E402
 from schemas import RawComment  # noqa: E402
 
 DATASET_PATH = Path(__file__).resolve().parent / "test_dataset.json"
 METRICS_PATH = REPO_ROOT / "data" / "eval_metrics.json"
 
-MAX_CONCURRENCY = 2      # max simultaneous LLM calls (free-tier safety)
-STAGGER_SECONDS = 4.0    # gap between task starts (~15 requests/min)
 COARSE_LABELS = ["positive", "neutral", "negative"]            # 3-class eval space
 VALID_EXPECTED = {"positive", "neutral", "negative", "mixed"}  # dataset label set
-
-
-@dataclass
-class CaseResult:
-    index: int
-    expected: str
-    predicted: str | None
-    error: str | None
 
 
 def load_dataset() -> list[dict]:
@@ -63,73 +67,73 @@ def load_dataset() -> list[dict]:
     return cases
 
 
-async def evaluate_case(
-    case: dict, index: int, total: int, sem: asyncio.Semaphore
-) -> CaseResult:
-    """Analyse one dataset row under the shared concurrency cap."""
-    async with sem:
-        comment = RawComment(
-            id=f"eval-{index:03d}",
+def _coarse(sentiment_value: str) -> str:
+    """Map Stage A's 5-class sentiment onto the 3-class eval space."""
+    return {"strongly_positive": "positive", "critical_escalation": "negative"}.get(
+        sentiment_value, sentiment_value
+    )
+
+
+def _comment_id(index: int) -> str:
+    return f"eval-{index:03d}"
+
+
+async def run_benchmark(*, persist_to_file: bool = True) -> dict:
+    cases = load_dataset()
+    print("=== SPEC §11 Track 1: Stage A sentiment benchmark ===")
+    print(f"Loaded {len(cases)} cases from {DATASET_PATH}")
+
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        raise SystemExit(
+            "OPENROUTER_API_KEY is required — Stage A classifies via OpenRouter "
+            "now (SPEC.md §4.1 amendment), not a local encoder or Gemini."
+        )
+
+    comments = [
+        RawComment(
+            id=_comment_id(i),
             platform=case["platform"],
             text=case["text"],
             author_id="eval_harness",
             timestamp=datetime.now(timezone.utc),
         )
-        try:
-            analyzed = await analyze_comment(comment)
-            result = CaseResult(
-                index=index, expected=case["expected_mood"],
-                predicted=analyzed.sentiment.value, error=None,
-            )
-        except Exception as exc:  # both providers failed — record and move on
-            result = CaseResult(
-                index=index, expected=case["expected_mood"],
-                predicted=None, error=f"{type(exc).__name__}: {exc}",
-            )
-        status = "OK  " if result.error is None else "FAIL"
-        pred = result.predicted or "-"
-        print(f"[{index + 1:>2}/{total}] {status}  "
-              f"expected={result.expected:<8} predicted={pred}")
-        return result
+        for i, case in enumerate(cases)
+    ]
 
-
-async def run_benchmark() -> None:
-    cases = load_dataset()
-    print("=== Node 5: Sentiment Detection Benchmark ===")
-    print(f"Loaded {len(cases)} cases from {DATASET_PATH}")
-    print(f"Concurrency={MAX_CONCURRENCY}, stagger={STAGGER_SECONDS}s\n")
-
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
-    tasks: list[asyncio.Task[CaseResult]] = []
-    for i, case in enumerate(cases):
-        if i > 0:
-            await asyncio.sleep(STAGGER_SECONDS)
-        tasks.append(asyncio.create_task(evaluate_case(case, i, len(cases), sem)))
-    results = await asyncio.gather(*tasks)
-
-    succeeded = [r for r in results if r.error is None]
-    failed = [r for r in results if r.error is not None]
+    error: str | None = None
+    try:
+        results_by_id = await classify_all_sentiments(comments, api_key=api_key)
+    except Exception as exc:  # noqa: BLE001 — record and report, don't crash the run
+        results_by_id = {}
+        error = f"{type(exc).__name__}: {exc}"
 
     metrics: dict = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "total_cases": len(cases),
-        "failed_cases": len(failed),
+        "failed_cases": len(cases) - len(results_by_id),
         "labels": COARSE_LABELS,
     }
 
-    if not succeeded:
-        print("\nAll cases failed — check API keys / connectivity. No metrics written.")
+    if not results_by_id:
+        print(f"\nBenchmark failed entirely — {error}\nNo metrics written.")
         metrics.update({"accuracy": None, "accuracy_lenient": None,
                         "mixed_cases": 0, "mixed_covered": 0,
-                        "confusion_matrix": None, "classification_report": None})
+                        "confusion_matrix": None, "classification_report": None,
+                        "error": error})
     else:
-        def coarse(s: str) -> str:
-            return {"strongly_positive": "positive",
-                    "critical_escalation": "negative"}.get(s, s)
+        scored: list[tuple[str, str | None]] = []
+        for i, case in enumerate(cases):
+            item = results_by_id.get(_comment_id(i))
+            predicted = _coarse(item.sentiment.value) if item is not None else None
+            status = "OK  " if item is not None else "FAIL"
+            print(f"[{i + 1:>2}/{len(cases)}] {status}  "
+                  f"expected={case['expected_mood']:<8} predicted={predicted or '-'}")
+            scored.append((case["expected_mood"], predicted))
 
-        scored = [(r.expected, coarse(r.predicted)) for r in succeeded]
-        strict_pairs = [(e, p) for e, p in scored if e != "mixed"]
-        mixed_preds = [p for e, p in scored if e == "mixed"]
+        strict_pairs = [(e, p) for e, p in scored if e != "mixed" and p is not None]
+        mixed_preds = [p for e, p in scored if e == "mixed" and p is not None]
+        scored_count = sum(1 for _, p in scored if p is not None)
 
         y_true = [e for e, _ in strict_pairs]
         y_pred = [p for _, p in strict_pairs]
@@ -152,14 +156,17 @@ async def run_benchmark() -> None:
 
         mixed_correct = sum(1 for p in mixed_preds if p in {"positive", "negative"})
         strict_correct = sum(1 for e, p in strict_pairs if e == p)
-        accuracy_lenient = (strict_correct + mixed_correct) / len(succeeded)
+        accuracy_lenient = (
+            (strict_correct + mixed_correct) / scored_count if scored_count else None
+        )
 
         if accuracy_strict is not None:
             print(f"\nStrict accuracy (non-mixed): {accuracy_strict:.3f} "
                   f"({len(strict_pairs)} scored)")
         else:
-            print("\nStrict accuracy: n/a — every scored case was 'mixed'")
-        print(f"Lenient accuracy (mixed counts if pos/neg): {accuracy_lenient:.3f}")
+            print("\nStrict accuracy: n/a — no case scored")
+        if accuracy_lenient is not None:
+            print(f"Lenient accuracy (mixed counts if pos/neg): {accuracy_lenient:.3f}")
         print(f"Mixed cases: {mixed_correct}/{len(mixed_preds)} resolved to a polarity")
 
         metrics.update({
@@ -170,10 +177,14 @@ async def run_benchmark() -> None:
             "confusion_matrix": cm.tolist() if cm is not None else None,
             "classification_report": report_dict,
         })
+        if error:
+            metrics["error"] = error  # partial-failure case: some results, some not
 
-    METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    METRICS_PATH.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    print(f"Metrics saved -> {METRICS_PATH}")
+    if persist_to_file:
+        METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        METRICS_PATH.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        print(f"Metrics saved -> {METRICS_PATH}")
+    return metrics
 
 
 if __name__ == "__main__":
