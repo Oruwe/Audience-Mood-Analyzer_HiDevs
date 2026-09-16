@@ -1,0 +1,4 @@
+spec_version: 0.1.0
+name: audience-mood-analyzer
+version: "1.0.0"
+description: Autonomous social listening agent that analyzes audience mood and sentiment from video comments.
