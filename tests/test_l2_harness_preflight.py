@@ -15,7 +15,6 @@ import json
 from types import SimpleNamespace
 
 import httpx
-import pytest
 
 import config.models as models
 import engine.batching as batching

@@ -26,6 +26,8 @@ normal module, with no Streamlit runtime required. `main()` and the
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import asyncio
 import logging
 import os
@@ -101,6 +103,14 @@ def _benchmark_dataset():
     """The eval dataset, imported on first use. See the note above."""
     import evals.benchmark as benchmark
     return benchmark.load_dataset()
+
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
+    # The return annotations below name altair types. `from __future__ import
+    # annotations` keeps them as strings so this costs nothing at run time --
+    # which is the whole point, since altair and pandas are deliberately
+    # lazy-imported to stay inside the 512 MiB budget (see requirements.txt).
+    import altair as alt
 
 
 def _charting():

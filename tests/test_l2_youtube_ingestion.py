@@ -15,7 +15,13 @@ import httpx
 import pytest
 
 from ingestion.dedup import ContentDeduplicator
-from ingestion.youtube import QuotaExceededError, QuotaLedger, estimate_channel_analysis, fetch_channel_comments
+from ingestion.youtube import (
+    MAX_COMMENTS_PER_VIDEO_DEFAULT,
+    QuotaExceededError,
+    QuotaLedger,
+    estimate_channel_analysis,
+    fetch_channel_comments,
+)
 
 API_KEY = "test-key"
 
@@ -78,21 +84,28 @@ def _build_handler(calls: list[str]):
         if path.endswith("/commentThreads"):
             video_id = params["videoId"][0]
             page_token = (params.get("pageToken") or [None])[0]
+            # The real API never returns more than maxResults. Honouring it
+            # here matters now that the caller relies on it to bound the
+            # pull: a stub that ignored maxResults would let a broken cap
+            # pass this suite.
+            max_results = int((params.get("maxResults") or ["100"])[0])
             if video_id == "v1":
                 return httpx.Response(200, json={
                     "items": [
                         _thread_item("c1", "  First   comment  "),
                         # same normalized text as c1 -> dedup must drop this one
                         _thread_item("c1-dup", "First comment"),
-                    ],
+                    ][:max_results],
                 })
             if video_id == "v2" and page_token is None:
                 items = [_thread_item(f"c2-{i}", f"comment number {i}") for i in range(100)]
                 items[0] = _thread_item("c2-email", "reach me at jane@example.com please")
-                return httpx.Response(200, json={"items": items, "nextPageToken": "page2"})
+                return httpx.Response(
+                    200, json={"items": items[:max_results], "nextPageToken": "page2"}
+                )
             if video_id == "v2" and page_token == "page2":
                 items = [_thread_item(f"c2b-{i}", f"comment number b{i}") for i in range(50)]
-                return httpx.Response(200, json={"items": items})
+                return httpx.Response(200, json={"items": items[:max_results]})
             raise AssertionError(f"unexpected commentThreads call: {request.url}")
         raise AssertionError(f"unexpected path: {path}")
 
@@ -125,16 +138,20 @@ def test_estimate_matches_spec_quota_formula():
     assert estimate.total_comment_count == 2 + 150 + 0
     # 1 (channels.list) + 1 (playlistItems.list) + 1 (videos.list, batched)
     assert estimate.units_already_spent_on_estimate == 3
-    # ceil(2/100) + ceil(150/100) + ceil(0/100) = 1 + 2 + 0
-    assert estimate.units_required_for_comment_pull == 3
-    assert estimate.total_units_required == 6
+    # Per-video cap (70) < page size (100), so every video with any comments
+    # costs exactly one page: v1 -> 1, v2 (150 comments, capped to 70) -> 1,
+    # v3 (none) -> 0. Before the cap existed v2 alone billed 2 pages here.
+    assert estimate.units_required_for_comment_pull == 2
+    assert estimate.total_units_required == 5
     assert ledger.spent == 3  # only the cheap estimate has been charged so far
 
 
 def test_comment_pull_refuses_cleanly_before_pulling_anything_when_over_budget():
     calls: list[str] = []
-    # Enough budget for the 3-unit estimate, not enough for the 3-unit pull.
-    ledger = QuotaLedger(daily_budget=5)
+    # Enough budget for the 3-unit estimate, not enough for the 2-unit pull
+    # that follows it. (The pull is 2 units rather than 3 because of the
+    # per-video comment cap -- see test_estimate_matches_spec_quota_formula.)
+    ledger = QuotaLedger(daily_budget=4)
 
     async def scenario():
         async with _client(calls) as client:
@@ -182,16 +199,32 @@ def test_full_pull_wires_normalizer_and_dedup():
     assert len(v1_comments) == 1
     assert v1_comments[0].text == "First comment"  # normalizer collapsed the whitespace
 
-    # v2: 150 distinct threads across two pages -> all survive.
+    # v2 has 150 comments across two pages, but the per-video cap stops the
+    # pull at MAX_COMMENTS_PER_VIDEO_DEFAULT. This is the bound the OOM
+    # postmortem asked for: the corpus size is a property of our config, not
+    # of how popular the video happens to be.
     v2_comments = [c for c in comments if c.video_id == "v2"]
-    assert len(v2_comments) == 150
+    assert len(v2_comments) == MAX_COMMENTS_PER_VIDEO_DEFAULT
+
+    # ...and the second page was never requested, so the cap saved quota
+    # rather than merely discarding comments we had already paid for.
+    assert not any("pageToken=page2" in c for c in calls)
+
+    # "Top" comments, not "most recent": a truncated pull ordered by time
+    # would be a different sample entirely, so the ordering is part of the
+    # contract now that truncation is guaranteed.
+    v2_calls = [c for c in calls if "videoId=v2" in c]
+    assert v2_calls and all("order=relevance" in c for c in v2_calls)
+    assert all(f"maxResults={MAX_COMMENTS_PER_VIDEO_DEFAULT}" in c for c in v2_calls)
 
     # normalizer.sanitize_comment_text ran on every comment, not just v1's.
     masked = next(c for c in v2_comments if "[EMAIL]" in c.text)
     assert "jane@example.com" not in masked.text
 
     assert all(c.platform == "youtube" for c in comments)
-    assert len(comments) == 1 + 150
+    assert len(comments) == 1 + MAX_COMMENTS_PER_VIDEO_DEFAULT
 
-    # Estimate (3) + actual pull (1 page for v1, 2 pages for v2, v3 skipped).
-    assert ledger.spent == 3 + 3
+    # Estimate (3) + actual pull (1 page for v1, 1 capped page for v2, v3
+    # skipped) -- and the ledger must agree with the pre-flight estimate,
+    # which is the whole point of computing one.
+    assert ledger.spent == 3 + 2

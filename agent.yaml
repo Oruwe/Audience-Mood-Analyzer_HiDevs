@@ -1,0 +1,4 @@
+spec_version: "0.1.0"
+name: audience-mood-analyzer
+version: "0.1.0"
+description: Clusters YouTube comment sentiment into content requests, confusion points and per-video mood, every claim backed by a verbatim quote.

@@ -51,7 +51,36 @@ COST_SEARCH_LIST = 100  # never spent by this module — recorded for the error 
 
 PLAYLIST_ITEMS_PAGE_SIZE = 50   # playlistItems.list maxResults ceiling
 VIDEOS_BATCH_SIZE = 50          # videos.list accepts up to 50 ids per call
-COMMENT_THREADS_PAGE_SIZE = 100  # commentThreads.list maxResults ceiling
+COMMENT_THREADS_PAGE_SIZE = 100  # commentThreads.list maxResults ceiling (API range: 1-100)
+
+# --- ingestion bounds (SPEC §4.4 "refuse before spending") -----------------
+#
+# How many comments one video may contribute to an analysis. Until this
+# existed, `fetch_video_comments` followed `nextPageToken` until YouTube ran
+# out: a video with 100k comments meant ~1,000 API calls (1,000 quota units
+# of a 10,000/day budget, from a single video), 100k RawComment objects held
+# in memory by orchestration's list comprehension, and all of them serialised
+# into one Postgres JSONB checkpoint. On a 512 MB box that is the OOM this
+# repo has already been bitten by once.
+#
+# 70 is chosen to sit under COMMENT_THREADS_PAGE_SIZE, which is the property
+# that actually matters: a cap of <=100 means every video costs exactly ONE
+# commentThreads.list page, so per-video quota is 1 unit flat and pagination
+# never runs. Raising this above 100 silently reintroduces multi-page pulls.
+MAX_COMMENTS_PER_VIDEO_DEFAULT = 70
+
+# Replies arrive inline in the same page as their parent thread, so they cost
+# no extra quota -- but they are unbounded in count, and one viral argument
+# under a single comment could otherwise consume the whole per-video budget
+# and crowd out every other voice. This is the traversal-depth bound.
+MAX_REPLIES_PER_THREAD_DEFAULT = 5
+
+# commentThreads.list accepts order=time (the API default) or order=relevance.
+# "Top comments" is the intent -- a truncated pull ordered by time is just the
+# most recent N, which is a different and much less useful sample. Because the
+# pull is now deliberately truncated, WHICH comments survive the truncation is
+# a correctness question, not a preference.
+COMMENT_ORDER = "relevance"
 
 DAILY_QUOTA_BUDGET_DEFAULT = 10_000  # Google's default per-project daily allocation
 
@@ -436,12 +465,25 @@ async def estimate_channel_analysis(
     )
 
 
-def _comment_pages(comment_count: int) -> int:
+def _comment_pages(
+    comment_count: int, max_comments: int = MAX_COMMENTS_PER_VIDEO_DEFAULT
+) -> int:
     """commentThreads.list pages (1 unit each) needed for *comment_count*
-    top-level threads, at COMMENT_THREADS_PAGE_SIZE per page."""
+    top-level threads, at COMMENT_THREADS_PAGE_SIZE per page, never more than
+    the cap requires.
+
+    The cap has to appear here as well as in the fetch loop, or the estimate
+    and the spend disagree: SPEC §4.4 refuses an analysis on the strength of
+    this number, so an estimate computed from the uncapped comment count
+    would refuse analyses the capped pull could comfortably afford -- a
+    100k-comment video reads as 1,000 units when it will really cost 1.
+    """
     if comment_count <= 0:
         return 0
-    return -(-comment_count // COMMENT_THREADS_PAGE_SIZE)  # ceil division
+    effective = min(comment_count, max(0, max_comments))
+    if effective <= 0:
+        return 0
+    return -(-effective // COMMENT_THREADS_PAGE_SIZE)  # ceil division
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +522,8 @@ async def fetch_video_comments(
     api_key: str,
     ledger: QuotaLedger,
     dedup: ContentDeduplicator | None = None,
+    max_comments: int = MAX_COMMENTS_PER_VIDEO_DEFAULT,
+    max_replies_per_thread: int = MAX_REPLIES_PER_THREAD_DEFAULT,
 ) -> AsyncIterator[RawComment]:
     """Paginate commentThreads.list for one video, yielding normalized,
     deduplicated RawComment records (top-level comments and their inline
@@ -487,14 +531,61 @@ async def fetch_video_comments(
     extra). Charges COST_COMMENT_THREADS_LIST per page *before* the request
     and raises QuotaExceededError rather than making a call it can't afford
     — never a partial pull that then dies mid-video.
+
+    Bounded twice, per SPEC §4.4 and CONVENTIONS' "bounded" rule:
+
+    * *max_comments* caps how many comments this video contributes in total,
+      counting replies. At the default (70, below the 100-per-page ceiling)
+      exactly one page is ever requested, so one video costs one quota unit
+      no matter how many comments it really has.
+    * *max_replies_per_thread* bounds reply traversal, so one runaway
+      argument under a single comment cannot consume the entire per-video
+      budget and crowd out every other commenter.
+
+    Truncation is logged with the count it dropped rather than passing
+    silently: a sampled corpus and an exhaustive one support different
+    claims, and a reader of the output has to be able to tell which they got.
     """
+    if max_comments <= 0:
+        logger.warning(
+            "max_comments=%d for video %s — nothing to fetch, skipping", max_comments, video_id
+        )
+        return
+
+    # Bound the WORK, not just the output. `yielded` counts comments that
+    # survive deduplication, so it is the wrong thing to stop on by itself: a
+    # comment section where every comment is a duplicate never increments it.
+    # That is not a hostile edge case -- re-analysing a video is the ordinary
+    # case, and on the second run the deduplicator has already seen every
+    # comment, so nothing is yielded and the loop pages on. Measured before
+    # this bound existed: a single video consumed the entire 10,000-unit daily
+    # quota and only stopped because the ledger refused the next call.
+    #
+    # The page budget is the same arithmetic `_comment_pages` uses for the
+    # pre-flight estimate, which is what keeps estimate and spend honest: the
+    # estimate promises one page for this video, so the fetcher may spend
+    # exactly one.
+    max_pages = _comment_pages(max_comments, max_comments)
+    yielded = 0
+    pages_fetched = 0
     page_token: str | None = None
     while True:
+        if pages_fetched >= max_pages:
+            logger.info(
+                "Video %s: stopped after %d page(s) (page budget); %d comment(s) "
+                "kept after deduplication",
+                video_id, pages_fetched, yielded,
+            )
+            break
         ledger.require(COST_COMMENT_THREADS_LIST)
         params: dict = {
             "part": "snippet,replies",
             "videoId": video_id,
-            "maxResults": COMMENT_THREADS_PAGE_SIZE,
+            # Never ask for more than the cap can accept. Over-fetching would
+            # still cost one unit, but it would parse and sanitize hundreds of
+            # comments only to drop them.
+            "maxResults": min(COMMENT_THREADS_PAGE_SIZE, max_comments),
+            "order": COMMENT_ORDER,
             "textFormat": "plainText",
         }
         if page_token:
@@ -512,20 +603,43 @@ async def fetch_video_comments(
                 return
             raise
         ledger.charge(COST_COMMENT_THREADS_LIST)
+        pages_fetched += 1
 
         for thread in data.get("items", []):
+            if yielded >= max_comments:
+                break
             top = thread["snippet"]["topLevelComment"]
             comment = _comment_from_snippet(top["id"], video_id, top["snippet"], is_reply=False)
             comment = await _dedup_pass(comment, dedup)
             if comment is not None:
                 yield comment
-            for reply in (thread.get("replies") or {}).get("comments", []):
+                yielded += 1
+
+            replies = (thread.get("replies") or {}).get("comments", [])
+            for reply in replies[:max_replies_per_thread]:
+                if yielded >= max_comments:
+                    break
                 reply_comment = _comment_from_snippet(
                     reply["id"], video_id, reply["snippet"], is_reply=True
                 )
                 reply_comment = await _dedup_pass(reply_comment, dedup)
                 if reply_comment is not None:
                     yield reply_comment
+                    yielded += 1
+            if len(replies) > max_replies_per_thread:
+                logger.info(
+                    "Video %s thread %s: kept %d of %d replies (max_replies_per_thread)",
+                    video_id, top["id"], max_replies_per_thread, len(replies),
+                )
+
+        if yielded >= max_comments:
+            # Degrade honestly: say the corpus is a sample, and say why.
+            logger.info(
+                "Video %s: stopped at the %d-comment cap (max_comments); "
+                "remaining comments were not fetched",
+                video_id, max_comments,
+            )
+            break
 
         page_token = data.get("nextPageToken")
         if not page_token:
@@ -551,9 +665,12 @@ async def fetch_channel_comments(
     api_key: str,
     ledger: QuotaLedger,
     dedup: ContentDeduplicator | None = None,
+    max_comments_per_video: int = MAX_COMMENTS_PER_VIDEO_DEFAULT,
+    max_replies_per_thread: int = MAX_REPLIES_PER_THREAD_DEFAULT,
 ) -> AsyncIterator[RawComment]:
-    """Pull every comment for every video in *estimate*, most-recent video
-    first. Call `estimate_channel_analysis` first and check
+    """Pull comments for every video in *estimate*, most-recent video first,
+    up to *max_comments_per_video* per video. Call
+    `estimate_channel_analysis` first and check
     `estimate.units_required_for_comment_pull <= ledger.remaining` (or just
     let this raise QuotaExceededError up front on the first page) — SPEC
     §4.4: refuse before spending, never half-fail partway through a video.
@@ -566,6 +683,8 @@ async def fetch_channel_comments(
             # that by not spending a call on it either.
             continue
         async for comment in fetch_video_comments(
-            video.video_id, client=client, api_key=api_key, ledger=ledger, dedup=dedup
+            video.video_id, client=client, api_key=api_key, ledger=ledger, dedup=dedup,
+            max_comments=max_comments_per_video,
+            max_replies_per_thread=max_replies_per_thread,
         ):
             yield comment

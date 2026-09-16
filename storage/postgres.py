@@ -36,9 +36,18 @@ import asyncpg
 
 JobStatus = Literal["pending", "running", "completed", "failed", "cancelled"]
 
+# SPEC §10 invariant 5. The app ships single-tenant (no st.login yet), so
+# every job it creates is owned by this sentinel. It is a real owner value,
+# not a "skip the check" flag: queries for 'public' are scoped exactly like
+# queries for any other tenant, so the isolation code path is the one that
+# runs in production rather than a branch only tests exercise.
+DEFAULT_OWNER_ID = "public"
+
+
 _SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS analysis_jobs (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id             TEXT NOT NULL DEFAULT 'public',
     channel_ref          TEXT NOT NULL,
     status               TEXT NOT NULL DEFAULT 'pending',
     stage                TEXT,
@@ -60,6 +69,14 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
 ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS total_comment_count INTEGER;
 ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ;
 
+-- SPEC §10 invariant 5 (tenant isolation). Rows created before this column
+-- existed belong to the single-tenant deployment, which is exactly what
+-- DEFAULT_OWNER_ID names -- so the backfill is the column default and there
+-- is no ambiguous NULL tenant to reason about later. NOT NULL is the point:
+-- a row with no owner would be readable by a query for any owner.
+ALTER TABLE analysis_jobs
+    ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'public';
+
 CREATE TABLE IF NOT EXISTS analysis_job_batches (
     job_id       UUID NOT NULL REFERENCES analysis_jobs(id) ON DELETE CASCADE,
     stage        TEXT NOT NULL,
@@ -76,8 +93,10 @@ CREATE TABLE IF NOT EXISTS analysis_job_batches (
 -- already covers a whole channel's videos): the most recent completed job
 -- for the same channel_ref with the same total_comment_count is reused
 -- instead of spending quota again.
+-- owner_id leads the index because every lookup is tenant-scoped first:
+-- the cache must not serve one tenant's completed analysis to another.
 CREATE INDEX IF NOT EXISTS idx_analysis_jobs_cache_lookup
-    ON analysis_jobs (channel_ref, total_comment_count, status, created_at DESC);
+    ON analysis_jobs (owner_id, channel_ref, total_comment_count, status, created_at DESC);
 
 -- Evaluation-criteria support ("Metrics Usage"): the last few times someone
 -- clicked "Run live accuracy benchmark" in the app (app.py), so the result
@@ -145,15 +164,35 @@ async def init_schema(conn: asyncpg.Connection) -> None:
 # Job lifecycle
 # ---------------------------------------------------------------------------
 
-async def create_job(conn: asyncpg.Connection, channel_ref: str) -> str:
+async def create_job(
+    conn: asyncpg.Connection, channel_ref: str, *, owner_id: str = DEFAULT_OWNER_ID
+) -> str:
+    """Create a job owned by *owner_id*. Every later read of this job, its
+    progress and its checkpoints must present the same owner_id or see
+    nothing (SPEC §10 invariant 5)."""
     row = await conn.fetchrow(
-        "INSERT INTO analysis_jobs (channel_ref) VALUES ($1) RETURNING id",
-        channel_ref,
+        "INSERT INTO analysis_jobs (owner_id, channel_ref) VALUES ($1, $2) RETURNING id",
+        owner_id, channel_ref,
     )
     return str(row["id"])
 
 
-async def claim_job(conn: asyncpg.Connection, job_id: str) -> bool:
+async def get_job_owner(conn: asyncpg.Connection, job_id: str) -> str | None:
+    """The owner of *job_id*, or None if no such job.
+
+    Deliberately the only unscoped lookup in this module, and it returns an
+    owner rather than any job content: the orchestrator calls it once, at
+    claim time, to learn which tenant it is working on behalf of, and then
+    passes that owner_id to every subsequent query. No caller-supplied
+    identifier reaches it except the job_id the orchestrator just created.
+    """
+    row = await conn.fetchrow("SELECT owner_id FROM analysis_jobs WHERE id = $1", job_id)
+    return row["owner_id"] if row is not None else None
+
+
+async def claim_job(
+    conn: asyncpg.Connection, job_id: str, *, owner_id: str = DEFAULT_OWNER_ID
+) -> bool:
     """Atomically transition *job_id* from 'pending' to 'running'.
 
     Returns True if this call performed the transition — the caller now
@@ -172,9 +211,9 @@ async def claim_job(conn: asyncpg.Connection, job_id: str) -> bool:
             claimed_at = now(),
             started_at = COALESCE(started_at, now()),
             updated_at = now()
-        WHERE id = $1 AND status = 'pending'
+        WHERE id = $1 AND status = 'pending' AND owner_id = $2
         """,
-        job_id,
+        job_id, owner_id,
     )
     return result == "UPDATE 1"
 
@@ -240,14 +279,26 @@ async def reap_stale_jobs(conn: asyncpg.Connection, *, stale_after_seconds: int 
     return int(result.removeprefix("UPDATE ").strip() or 0)
 
 
-async def request_cancellation(conn: asyncpg.Connection, job_id: str) -> None:
+async def request_cancellation(
+    conn: asyncpg.Connection, job_id: str, *, owner_id: str = DEFAULT_OWNER_ID
+) -> None:
+    """Cancelling is a write to another tenant's job if it is not scoped —
+    a denial-of-service across the isolation boundary, not just a read leak.
+    """
     await conn.execute(
-        "UPDATE analysis_jobs SET cancel_requested = TRUE, updated_at = now() WHERE id = $1",
-        job_id,
+        "UPDATE analysis_jobs SET cancel_requested = TRUE, updated_at = now() "
+        "WHERE id = $1 AND owner_id = $2",
+        job_id, owner_id,
     )
 
 
 async def is_cancel_requested(conn: asyncpg.Connection, job_id: str) -> bool:
+    """Unscoped by design, and safe because of what it returns and who calls
+    it: a single boolean flag (no tenant content) on the job the orchestrator
+    is itself running, polled from inside that job's own loop. The flag can
+    only be *set* through `request_cancellation`, which is owner-scoped — so
+    a foreign tenant cannot make this return True for someone else's job.
+    """
     row = await conn.fetchrow(
         "SELECT cancel_requested FROM analysis_jobs WHERE id = $1", job_id
     )
@@ -296,7 +347,11 @@ async def set_total_comment_count(conn: asyncpg.Connection, job_id: str, n: int)
 
 
 async def find_reusable_job(
-    conn: asyncpg.Connection, channel_ref: str, total_comment_count: int
+    conn: asyncpg.Connection,
+    channel_ref: str,
+    total_comment_count: int,
+    *,
+    owner_id: str = DEFAULT_OWNER_ID,
 ) -> str | None:
     """SPEC §4.2: "Cache by video, not by request... If the comment count
     hasn't moved, serve the cached analysis." The most recent *completed*
@@ -308,10 +363,11 @@ async def find_reusable_job(
         """
         SELECT id FROM analysis_jobs
         WHERE channel_ref = $1 AND total_comment_count = $2 AND status = 'completed'
+          AND owner_id = $3
         ORDER BY created_at DESC
         LIMIT 1
         """,
-        channel_ref, total_comment_count,
+        channel_ref, total_comment_count, owner_id,
     )
     return str(row["id"]) if row is not None else None
 
@@ -339,8 +395,12 @@ class JobProgress:
         return min(1.0, self.completed_units / self.total_units)
 
 
-async def get_job_progress(conn: asyncpg.Connection, job_id: str) -> JobProgress | None:
-    row = await conn.fetchrow("SELECT * FROM analysis_jobs WHERE id = $1", job_id)
+async def get_job_progress(
+    conn: asyncpg.Connection, job_id: str, *, owner_id: str = DEFAULT_OWNER_ID
+) -> JobProgress | None:
+    row = await conn.fetchrow(
+        "SELECT * FROM analysis_jobs WHERE id = $1 AND owner_id = $2", job_id, owner_id
+    )
     if row is None:
         return None
     return JobProgress(
@@ -394,35 +454,45 @@ async def record_batch_result(
 
 
 async def get_completed_batch_keys(
-    conn: asyncpg.Connection, job_id: str, stage: str
+    conn: asyncpg.Connection, job_id: str, stage: str, *, owner_id: str = DEFAULT_OWNER_ID
 ) -> set[str]:
     """Which batch_keys already have a completed checkpoint for this job +
     stage — SPEC §8: "On start, load completed batches and skip them."
     """
     rows = await conn.fetch(
-        "SELECT batch_key FROM analysis_job_batches "
-        "WHERE job_id = $1 AND stage = $2 AND status = 'completed'",
-        job_id, stage,
+        """
+        SELECT b.batch_key
+        FROM analysis_job_batches b
+        JOIN analysis_jobs j ON j.id = b.job_id
+        WHERE b.job_id = $1 AND b.stage = $2 AND b.status = 'completed'
+          AND j.owner_id = $3
+        """,
+        job_id, stage, owner_id,
     )
     return {r["batch_key"] for r in rows}
 
 
 async def get_batch_results(
-    conn: asyncpg.Connection, job_id: str, stage: str
+    conn: asyncpg.Connection, job_id: str, stage: str, *, owner_id: str = DEFAULT_OWNER_ID
 ) -> dict[str, dict]:
     """Every completed checkpoint's stored result for this job + stage,
     keyed by batch_key -- lets a resumed job rebuild state from Postgres
     instead of only knowing *that* a batch is done."""
     rows = await conn.fetch(
-        "SELECT batch_key, result FROM analysis_job_batches "
-        "WHERE job_id = $1 AND stage = $2 AND status = 'completed' AND result IS NOT NULL",
-        job_id, stage,
+        """
+        SELECT b.batch_key, b.result
+        FROM analysis_job_batches b
+        JOIN analysis_jobs j ON j.id = b.job_id
+        WHERE b.job_id = $1 AND b.stage = $2 AND b.status = 'completed'
+          AND b.result IS NOT NULL AND j.owner_id = $3
+        """,
+        job_id, stage, owner_id,
     )
     return {r["batch_key"]: json.loads(r["result"]) for r in rows}
 
 
 async def get_stage_checkpoint_summary(
-    conn: asyncpg.Connection, job_id: str
+    conn: asyncpg.Connection, job_id: str, *, owner_id: str = DEFAULT_OWNER_ID
 ) -> dict[str, dict]:
     """Per-stage checkpoint count and latest `completed_at` for *job_id* --
     the raw material app.py's `stage_durations_seconds` uses to derive an
@@ -433,12 +503,13 @@ async def get_stage_checkpoint_summary(
     """
     rows = await conn.fetch(
         """
-        SELECT stage, MAX(completed_at) AS last_at, COUNT(*) AS n
-        FROM analysis_job_batches
-        WHERE job_id = $1 AND status = 'completed'
-        GROUP BY stage
+        SELECT b.stage, MAX(b.completed_at) AS last_at, COUNT(*) AS n
+        FROM analysis_job_batches b
+        JOIN analysis_jobs j ON j.id = b.job_id
+        WHERE b.job_id = $1 AND b.status = 'completed' AND j.owner_id = $2
+        GROUP BY b.stage
         """,
-        job_id,
+        job_id, owner_id,
     )
     return {r["stage"]: {"last_at": r["last_at"], "n": r["n"]} for r in rows}
 

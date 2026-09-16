@@ -190,7 +190,7 @@ def test_cancellation_stops_the_job_between_stages(monkeypatch, pg_dsn):
             )
         return job_id
 
-    job_id = _run(scenario())
+    _run(scenario())
     assert "fetch_video" not in calls  # never got past the first cancel check
 
 

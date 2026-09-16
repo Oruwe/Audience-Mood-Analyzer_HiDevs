@@ -30,6 +30,7 @@ No signup, no OAuth. One Streamlit process, one Postgres connection string.
 - [Testing](#testing)
 - [Security model](#security-model)
 - [Deployment](#deployment)
+- [Agent identity (OpenGAP)](#agent-identity-opengap)
 - [Known limitations](#known-limitations)
 - [Project layout](#project-layout)
 
@@ -267,9 +268,23 @@ Before the caller sees a single comment it has already been through:
 - **`dedup.py`** — a normalised SHA-256 fingerprint per comment, with a TTL
   window. In-memory LRU by default, Redis if `REDIS_URL` is set.
 
+The pull is **bounded on purpose**: at most 70 comments per video, ordered by
+relevance rather than recency, and at most 5 replies per thread. 70 sits below
+the API's 100-per-page ceiling, and that is the point — every video costs
+exactly one `commentThreads.list` page, so a video with 700,000 comments costs
+the same single quota unit as one with 70. Before this cap existed the fetcher
+followed `nextPageToken` until YouTube ran out: a popular video meant ~1,000
+API calls, 100k comment objects held in memory, and all of them serialised into
+one Postgres JSONB checkpoint — which is the OOM kill this project has already
+been bitten by once. Truncation is logged per video with its reason, never
+passed off as a complete read. The trade is stated in
+[Known limitations](#known-limitations): this is a sample, not a census.
+
 Quota is estimated **before** the job starts, and a channel that would exceed
 the remaining budget is refused up front with a number. A clear refusal reads
-as competence; a spinner that dies halfway does not.
+as competence; a spinner that dies halfway does not. The estimate applies the
+same cap the fetcher does, so the number the UI refuses on is the number the
+pull actually spends.
 
 ### Stage A — sentiment + embeddings over 100% of comments
 
@@ -512,10 +527,11 @@ pytest -k invariant                 # just the security contract tests
 python -m evals.benchmark           # live sentiment accuracy + confusion matrix
 ```
 
-**290 passing, 1 skipped** with a database reachable (245 passing, 46 skipped
+**322 passing, 0 skipped** with a database reachable (268 passing, 54 skipped
 without one — the skips are the Postgres integration tests, which enable
-themselves as soon as `DATABASE_URL` points at a live database). The single
-test that stays skipped either way is invariant 5 (see below).
+themselves as soon as `DATABASE_URL` points at a live database). Nothing is
+skipped unconditionally any more: invariant 5 used to be, and is now enforced
+and tested (see the invariant table below).
 
 Tests are organised in two levels:
 
@@ -536,7 +552,7 @@ shows them.**
 | 2 | Output is a constrained schema, not free text | ✅ enforced | Injection payloads fuzzed through the classifier; output stays in-enum |
 | 3 | Every quoted comment is real | ✅ enforced | Verbatim match against the source corpus |
 | 4 | No injection via comment text | ✅ enforced | `unsafe_allow_html` grep **and** markdown-escaping behaviour |
-| 5 | Tenant isolation | ⏸ test written, skipped | Needs the auth layer that doesn't exist yet — the test is in the tree and un-skips the day it lands |
+| 5 | Tenant isolation | ✅ enforced | `owner_id` predicate in SQL on every query reachable with a caller-supplied job id (`storage/postgres.py`), incl. the reuse cache, cancel and claim paths. 9 integration tests hand user A user B's exact job id and assert they get nothing. Auth to issue real owner ids is still missing — see Known limitations |
 | 6 | Least privilege + encrypted tokens | n/a | No user token exists to encrypt: this app reads only public comment data with a plain API key, so there is no OAuth flow |
 | 7 | Spend cannot run away | ❌ gap | Not implemented. Spend is bounded indirectly, by YouTube's daily quota and the 15-minute job deadline, not by an explicit cap at OpenRouter |
 
@@ -627,18 +643,60 @@ Stated plainly, because a README that only lists strengths is not useful.
   scikit-learn was replaced with `engine/clustering.py` and why altair, pandas
   and the eval module are imported lazily. There is headroom now, but not a
   lot — a large channel's embeddings are the next thing that would eat it.
-- **Single-user, no auth.** Queries are written to be `user_id`-scoped and the
-  tenant-isolation test is already in the tree, but it skips: there is no auth
-  layer for it to test against yet.
+- **Single-user, no auth — but the isolation is real.** Every query reachable
+  with a caller-supplied job id now carries an `owner_id` predicate in SQL
+  (`storage/postgres.py`), and `tests/test_l2_invariant5_tenant_isolation.py`
+  proves it against a real Postgres by handing user A user B's exact job id.
+  What is still missing is the *authentication* layer that would assign real
+  owner ids: without `st.login`, every job is created under the single
+  `DEFAULT_OWNER_ID` tenant. The enforcement is built and tested; the identities
+  it would enforce between are not yet issued.
+- **It reads a sample, not the whole comment section.** Ingestion is capped at
+  70 comments per video (ordered by relevance) and 5 replies per thread. This
+  is what makes cost predictable — one quota unit per video regardless of
+  popularity — but it means "what your audience is asking for" is really "what
+  the comments YouTube ranks highest are asking for." On a video with 50,000
+  comments that is a 0.14% sample, and a brigaded or heavily-moderated comment
+  section will skew it in ways the pipeline cannot detect. Truncation is logged
+  per video rather than passing silently.
 - **No hard spend cap.** Invariant 7 is unimplemented. Cost is bounded
   indirectly — by YouTube's 10,000-unit daily quota and the 15-minute job
   deadline — not by an explicit limit at the provider.
 
 ---
 
+## Agent identity (OpenGAP)
+
+The repo is a valid [OpenGAP](https://github.com/open-gitagent/opengap) agent.
+Three files carry the identity, and they are checked by the real validator
+(`npm i -g @open-gitagent/opengap && opengap validate`), not by assertion:
+
+```
+✓ agent.yaml — valid
+✓ SOUL.md — valid
+✓ Validation passed (0 warnings)
+```
+
+| File | What it is |
+|---|---|
+| `agent.yaml` | The manifest. Four scalar fields, no arrays or nested objects — the schema sets `additionalProperties: false`, so an extra key is a hard failure |
+| `SOUL.md` | What the agent decides (how to cluster sentiment) and what it never decides (it never replies to a comment, never alters raw data), plus a **Boundaries** section |
+| `EXPLAINABILITY.md` | `Decision Reasoning`, `Data Inputs`, `Known Limitations` — exactly two sentences each |
+
+Two things worth recording, because both contradict what you might assume:
+`spec_version` is **optional** in the 0.1.0 schema (it has a default), and
+`SOUL.md` is **required** and must contain at least one paragraph of prose — a
+file of bare headings fails with "SOUL.md contains only headings". The CLI is
+an npm package; there is no `opengap` on PyPI.
+
+---
+
 ## Project layout
 
 ```
+agent.yaml                OpenGAP manifest — four scalar fields, nothing else
+SOUL.md                   What it decides, what it never decides, boundaries
+EXPLAINABILITY.md         Reasoning, inputs, limitations — two sentences each
 app.py                    Streamlit UI — the only entrypoint
 orchestration.py          The checkpointed, cancellable, resumable job
 resilience.py             Retry + fallback predicates, tenacity wiring

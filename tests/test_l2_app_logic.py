@@ -11,7 +11,6 @@ are tested against this sandbox's real local Postgres (tests/conftest.py's
 import asyncio
 
 import asyncpg
-import pytest
 
 import app
 from ingestion.youtube import QuotaLedger

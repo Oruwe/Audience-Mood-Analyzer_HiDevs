@@ -43,7 +43,7 @@ def test_unsafe_allow_html_never_appears_in_the_codebase():
 # behaviour rather than the absence of one flag.
 # ---------------------------------------------------------------------------
 
-import app
+import app  # noqa: E402 - kept below the block comment above, which explains what these tests pin
 
 
 def test_an_image_comment_cannot_fire_a_request_from_the_report():
